@@ -54,13 +54,24 @@ def iso_param_ranks(d_values, n_neurons: int, ref_d: int, vocab: int) -> dict:
     return ranks
 
 
-def build_ladder(d_values, n_neurons: int, ref_d: int, iso_ranks: dict | None = None):
+#: Each base architecture and the presets for its two in-family ablations. The
+#: rungs must all share a base, or the ladder compares across two architectures
+#: and attributes the difference to whichever knob is being studied.
+BASES = {
+    "ref": ("ref", "frozen", "freeweight"),
+    "ref2": ("ref2", "frozen2", "freeweight2"),
+}
+
+
+def build_ladder(d_values, n_neurons: int, ref_d: int, iso_ranks: dict | None = None,
+                 base: str = "ref2"):
     """Each rung: (name, preset, extra CLI flags, one-line purpose)."""
+    main, frozen, freeweight = BASES[base]
     # The control has to be the reference architecture with the positions
     # frozen, not a differently-shaped model. Inheriting d from the preset
     # instead of ref_d would make it a control for a run nobody is doing.
     rungs = [
-        ("control-frozen", "frozen", ["--d-space", str(ref_d)],
+        ("control-frozen", frozen, ["--d-space", str(ref_d)],
          "echo state network: positions frozen, only the readout learns"),
     ]
     for d in d_values:
@@ -70,19 +81,20 @@ def build_ladder(d_values, n_neurons: int, ref_d: int, iso_ranks: dict | None = 
             flags += ["--readout-rank", str(iso_ranks[d])]
             note = f", readout rank {iso_ranks[d]} to hold the parameter budget"
         rungs.append((
-            f"brain-d{d}", "ref", flags,
+            f"brain-d{d}", main, flags,
             f"geometric model, {d}-dimensional brain space{note}",
         ))
     rungs += [
-        ("ablate-freeweight", "freeweight", ["--d-space", str(ref_d)],
+        ("ablate-freeweight", freeweight, ["--d-space", str(ref_d)],
          "same topology and dynamics, edge weights are free parameters"),
         ("baseline-gru", "gru", [], "parameter-matched GRU: the fair fight"),
         ("baseline-transformer", "transformer", [],
          "parameter-matched transformer: the ceiling, for context only"),
     ]
+    brain_presets = {p for triple in BASES.values() for p in triple}
     out = []
     for name, preset, flags, why in rungs:
-        if preset in ("ref", "frozen", "freeweight"):
+        if preset in brain_presets:
             flags = flags + ["--n-neurons", str(n_neurons)]
         out.append((name, preset, flags, why))
     return out
@@ -256,6 +268,11 @@ def main() -> None:
     ap.add_argument("--budget-hours", type=float, default=44.0)
     ap.add_argument("--d-values", default="2,4,8,16,32,64")
     ap.add_argument("--ref-d", type=int, default=16)
+    ap.add_argument("--base", default="ref2", choices=sorted(BASES),
+                    help="architecture the whole ladder is built on. ref2 fixes "
+                         "the input injection and gives the neurons a spread of "
+                         "time constants; ref is the original, kept only for "
+                         "reproducing earlier runs.")
     ap.add_argument("--iso-params", action="store_true",
                     help="hold every d at the same parameter budget by trading "
                          "against the readout rank; removes the size confound "
@@ -297,7 +314,8 @@ def main() -> None:
               f"d={args.ref_d} model:")
         print("  " + "  ".join(f"d={d}:r={r}" for d, r in iso_ranks.items()) + "\n")
 
-    ladder = build_ladder(d_values, args.n_neurons, args.ref_d, iso_ranks)
+    ladder = build_ladder(d_values, args.n_neurons, args.ref_d, iso_ranks, args.base)
+    print(f"[base] ladder built on '{args.base}'\n")
     if args.only:
         keep = {s.strip() for s in args.only.split(",")}
         ladder = [r for r in ladder if r[0] in keep]

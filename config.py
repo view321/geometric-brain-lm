@@ -296,6 +296,34 @@ def _frozen() -> RunConfig:
     return cfg
 
 
+def _frozen2() -> RunConfig:
+    """The echo-state control for `ref2`. A control has to share the
+    architecture it controls for, so this tracks ref2 rather than ref."""
+    cfg = _ref2()
+    cfg.name = "control-frozen"
+    cfg.brain.freeze_positions = True
+    cfg.brain.freeze_input = True
+    cfg.brain.knn_refresh = 0
+    cfg.train.balance_coef = 0.0
+    cfg.train.reseed_interval = 0
+    return cfg
+
+
+def _free_weights2() -> RunConfig:
+    """The free-weight ablation for `ref2`.
+
+    Now the most important rung in the ladder. Propagation was measured to be
+    worth ~16x perplexity, so the connectome is load-bearing -- but that leaves
+    open whether the work is done by the *distance kernel* or merely by having
+    a sparse topology. This isolates exactly that.
+    """
+    cfg = _ref2()
+    cfg.name = "ablate-freeweight"
+    cfg.brain.free_weights = True
+    cfg.brain.knn_refresh = 0
+    return cfg
+
+
 def _gru() -> RunConfig:
     cfg = RunConfig(name="baseline-gru", model="gru")
     cfg.baseline = BaselineConfig(kind="gru", d_model=384, n_layers=3)
@@ -317,6 +345,8 @@ PRESETS = {
     "big": _big,
     "freeweight": _free_weights,
     "frozen": _frozen,
+    "freeweight2": _free_weights2,
+    "frozen2": _frozen2,
     "gru": _gru,
     "transformer": _transformer,
 }
