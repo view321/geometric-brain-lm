@@ -173,6 +173,90 @@ def generate(model, tokenizer, prompt: str = "", *, max_new: int = 128,
 
 
 @torch.no_grad()
+def memory_horizon(model, *, tokens: int = 128, trials: int = 16,
+                   seed: int = 0, stream=None) -> dict:
+    """How long does one token's footprint survive in the state?
+
+    Inject a probe token, record which neurons it leaves active, then feed
+    unrelated tokens and track what fraction of that set is still active. The
+    half-life is the effective context window of the recurrence, which is the
+    number that actually bounds how far back the model can refer.
+
+    Also reports how much of the *current* token survives into a populated
+    state. If that is near zero the model is not integrating its input at all,
+    it is coasting on whatever entered first.
+
+    Run this on a trained checkpoint. Measured on random initial positions it
+    describes the initialization, not the model: a trained point cloud has
+    attractor structure that a random one does not, and that is exactly what
+    would change these numbers.
+    """
+    if not hasattr(model, "axon"):
+        return {}
+    device = next(model.parameters()).device
+    cfg = model.cfg
+    gen = torch.Generator(device="cpu").manual_seed(seed)
+    vocab = cfg.vocab_size
+
+    def rand_tok(n=1):
+        return torch.randint(0, vocab, (n,), generator=gen).to(device)
+
+    w, signs, dec = model.edge_weights(), model.signs(), model.decays()
+    band = cfg.n_neurons // cfg.n_bands
+    curve = torch.zeros(tokens)
+    per_band = torch.zeros(cfg.n_bands, tokens)
+    entry = []
+
+    for tr in range(trials):
+        state = model.init_state(1, device)
+        # Warm the state so the probe lands in a populated system, not an empty one.
+        for _ in range(16):
+            state = model.step(rand_tok(), state, w, signs, None, dec)
+
+        probe = rand_tok()
+        state = model.step(probe, state, w, signs, None, dec)
+        tracked = model._kwta(state)[2][0]
+        tset = set(tracked.tolist())
+        bands = [{i for i in tset if i // band == b} for b in range(cfg.n_bands)]
+
+        for t in range(tokens):
+            tok = rand_tok()
+            # What fraction of THIS token's seeds survives the k-WTA?
+            p = model.tok_pos(tok)
+            sq = (p.pow(2).sum(-1, keepdim=True) - 2.0 * (p @ model.dend.t())
+                  + model.dend.pow(2).sum(-1).unsqueeze(0)).clamp_min(0.0)
+            want = set((-sq).topk(cfg.seed_n, dim=-1).indices[0].tolist())
+
+            state = model.step(tok, state, w, signs, None, dec)
+            live = set(model._kwta(state)[2][0].tolist())
+            entry.append(len(want & live) / max(len(want), 1))
+            curve[t] += len(tset & live) / max(len(tset), 1) / trials
+            for b in range(cfg.n_bands):
+                if bands[b]:
+                    per_band[b, t] += len(bands[b] & live) / len(bands[b]) / trials
+
+    def half_life(c):
+        below = (c < 0.5).nonzero()
+        return int(below[0]) + 1 if below.numel() else f">{len(c)}"
+
+    out = {
+        "half_life": half_life(curve),
+        "retention_t1": float(curve[0]),
+        "retention_t8": float(curve[min(7, tokens - 1)]),
+        "retention_t32": float(curve[min(31, tokens - 1)]),
+        "current_token_entry": sum(entry) / len(entry),
+        "trials": trials,
+    }
+    if cfg.n_bands > 1:
+        tau = -1.0 / torch.log(dec.clamp(1e-6, 1 - 1e-6))
+        out["band_half_life"] = [half_life(per_band[b]) for b in range(cfg.n_bands)]
+        out["band_tau_median"] = [
+            float(tau[b * band:(b + 1) * band].median()) for b in range(cfg.n_bands)
+        ]
+    return out
+
+
+@torch.no_grad()
 def geometry_diagnostics(model, stream=None, *, batch_size: int = 8,
                          seq_len: int = 128) -> dict:
     """What the learned space actually looks like.
@@ -191,7 +275,14 @@ def geometry_diagnostics(model, stream=None, *, batch_size: int = 8,
         **edge_length_stats(model.axon, model.dend, model.knn_idx),
         "sigma": float(model.log_sigma.exp()),
         "gain": float(model.gain),
+        # Multiplier on the per-neuron write rate. Near zero means the model has
+        # stopped listening to its input.
+        "input_gate": float(model.gate_logit.exp()),
     }
+    dec = model.decays()
+    tau = -1.0 / torch.log(dec.clamp(1e-6, 1 - 1e-6))
+    out["tau_median"] = float(tau.median())
+    out["tau_p95"] = float(tau.quantile(0.95))
     if model.cfg.dale:
         s = model.signs()
         out["excitatory_frac"] = float((s > 0).float().mean())
@@ -248,6 +339,9 @@ def main() -> None:
     ap.add_argument("--prompt", default="")
     ap.add_argument("--temperature", type=float, default=0.8)
     ap.add_argument("--diagnostics", action="store_true")
+    ap.add_argument("--memory", action="store_true",
+                    help="measure the effective context window of the recurrence")
+    ap.add_argument("--memory-trials", type=int, default=16)
     ap.add_argument("--json", default=None, help="write metrics here")
     args = ap.parse_args()
 
@@ -265,6 +359,8 @@ def main() -> None:
     )
     if args.diagnostics:
         metrics.update(geometry_diagnostics(model, stream))
+    if args.memory:
+        metrics.update(memory_horizon(model, trials=args.memory_trials))
 
     print(json.dumps(metrics, indent=2, sort_keys=True))
     if args.json:

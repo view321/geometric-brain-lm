@@ -46,6 +46,28 @@ class BrainConfig:
     rounds: int = 3        # propagation rounds per token
     decay: float = 0.85    # state leak, per round and across tokens
 
+    # Global multiplier on the per-neuron write rate, which is otherwise
+    # (1 - decay_i) -- so each neuron integrates at its own timescale. 1.0 is a
+    # plain exponential moving average. The seed is first normalized to the
+    # state's scale; without that the raw kernel values arrive ~12x weaker than
+    # the resident activation and the k-WTA evicts 93% of every token's seeds.
+    input_gate: float = 1.0
+    learn_input_gate: bool = True
+
+    # Per-neuron timescales. One global decay gives every neuron the same ~14
+    # token horizon; a spread of time constants lets fast neurons carry syntax
+    # while slow ones hold the protagonist. This is the mechanism behind S4 and
+    # Mamba, and it costs N parameters.
+    learn_decay: bool = False
+    decay_tau_min: float = 1.5     # fastest neuron's time constant, in tokens
+    decay_tau_max: float = 250.0   # slowest
+
+    # k-WTA budget split evenly across timescale bands. With mixed timescales a
+    # single global top-k is won permanently by the slow neurons, which retain
+    # magnitude by construction, so the fast ones starve. Bands guarantee every
+    # timescale a fixed share of the active set. 1 = plain global top-k.
+    n_bands: int = 1
+
     kernel: str = "gaussian"     # gaussian | cauchy
     sigma_init: float = 1.0
     learn_sigma: bool = True
@@ -87,6 +109,20 @@ class BrainConfig:
             raise ValueError(f"unknown readout {self.readout!r}")
         if self.activation not in ("relu", "tanh", "identity"):
             raise ValueError(f"unknown activation {self.activation!r}")
+        if self.n_bands < 1:
+            raise ValueError(f"n_bands must be >= 1, got {self.n_bands}")
+        if self.n_neurons % self.n_bands:
+            raise ValueError(
+                f"n_neurons ({self.n_neurons}) must divide evenly into "
+                f"n_bands ({self.n_bands})"
+            )
+        if self.top_n % self.n_bands:
+            raise ValueError(
+                f"top_n ({self.top_n}) must divide evenly into "
+                f"n_bands ({self.n_bands})"
+            )
+        if not 0.0 < self.decay_tau_min <= self.decay_tau_max:
+            raise ValueError("require 0 < decay_tau_min <= decay_tau_max")
 
 
 @dataclass
@@ -204,6 +240,23 @@ def _ref() -> RunConfig:
     return cfg
 
 
+def _ref2() -> RunConfig:
+    """Reference run with a working leaky integrator and mixed timescales.
+
+    `ref` writes each token into the state ~12x too weakly, so the k-WTA
+    discards most of it and the effective context is one clause. This preset
+    fixes the injection scale and gives the neurons a spread of time constants
+    from ~1.5 to ~250 tokens instead of a single 14-token horizon.
+    """
+    cfg = RunConfig(name="brain2-d16")
+    cfg.brain = BrainConfig(
+        n_neurons=32768, d_space=16, top_n=1024, seed_n=128,
+        learn_decay=True, n_bands=4, input_gate=0.35,
+    )
+    cfg.train = TrainConfig(steps=20000, batch_size=32, seq_len=256)
+    return cfg
+
+
 def _big() -> RunConfig:
     cfg = RunConfig(name="brain-big")
     cfg.brain = BrainConfig(n_neurons=65536, d_space=32, top_n=1024, readout_rank=384)
@@ -254,6 +307,7 @@ def _transformer() -> RunConfig:
 PRESETS = {
     "smoke": _smoke,
     "ref": _ref,
+    "ref2": _ref2,
     "big": _big,
     "freeweight": _free_weights,
     "frozen": _frozen,

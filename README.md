@@ -151,6 +151,20 @@ Every run writes `config.json`, `log.jsonl`, `summary.json`, `best.pt`, and
 These are the failure modes the design already accounts for. They are recorded
 because each one is silent — the run completes and the number is wrong.
 
+- **The state has to be able to hear its input.** Homeostasis normalises the
+  state to fixed RMS, so each active neuron carries `sqrt(N / top_n)` — about 12x
+  a raw kernel value at the reference config. Adding an un-normalised seed to
+  that made the k-WTA discard **93% of every token's seed neurons**, so the state
+  coasted on whatever entered first instead of integrating the sequence. The
+  seed is now normalised to the state's scale first. Measure it with
+  `evaluate.py --memory`: `current_token_entry` near zero means the model has
+  stopped listening.
+- **The write rate must be coupled to the decay.** Fixing the injection scale
+  with a single global gate swings the failure the other way — retention
+  collapsed from 14 tokens to 3, because a gate large enough for fast neurons to
+  track the current token also overwrites the slow ones. Each neuron now writes
+  at `1 - decay_i`, making the state a bank of exponential moving averages at
+  different timescales rather than one blur.
 - **A single point per neuron makes the kernel symmetric**, so `w_ij == w_ji`
   and no directed information can flow. Hence two coordinates per neuron. (This
   makes the model structurally query/key attention with a distance kernel in
@@ -197,3 +211,27 @@ because each one is silent — the run completes and the number is wrong.
   initialisation, and k-WTA width are held fixed across the sweep. A knee could
   in principle be a tuning artifact; the honest follow-up for whichever d wins
   is a short LR sweep at that d before believing the shape of the curve.
+- **Memory dynamics must be measured on a trained model.** `--memory` on random
+  initial positions characterises the initialization, not the architecture: a
+  trained point cloud has attractor structure a random one does not, and that is
+  precisely what would change retention. Attempts to identify what bounds the
+  horizon from untrained weights produced non-monotonic noise across every knob
+  tried (capacity, time constants, propagation rounds). Treat the horizon as an
+  empirical property of each checkpoint, not something predictable from config.
+
+## Effective context
+
+The recurrence, not the training window, is what bounds how far back the model
+can refer. `python evaluate.py --ckpt <ckpt> --memory` reports the half-life of
+a token's footprint in the state, per timescale band, plus how much of the
+current token survives into a populated state.
+
+This matters because the two are easily confused. Training at `seq_len 256`
+does not mean the model uses 256 tokens of context — if the half-life is 15,
+it is using about 6% of its window, and generated text will be locally fluent
+while losing entities across a sentence. Check the horizon before concluding
+anything from a sample that reads incoherent.
+
+The `ref2` preset is `ref` with the injection scale fixed, a spread of time
+constants from ~1.5 to ~250 tokens, and the k-WTA budget split across four
+timescale bands so that slow neurons are not evicted by fast ones.

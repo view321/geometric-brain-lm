@@ -50,7 +50,8 @@ def param_count(cfg: BrainConfig) -> int:
     total = 2 * n * d          # axon + dendrite coordinates
     total += v * d             # token -> brain space
     total += n                 # Dale sign logits
-    total += 2                 # log_sigma, gain
+    total += n                 # per-neuron decay logits
+    total += 3                 # log_sigma, gain, input gate
     if cfg.free_weights:
         total += n * cfg.k_max
     if cfg.readout == "lowrank":
@@ -77,7 +78,7 @@ def solve_readout_rank(cfg: BrainConfig, target: int) -> int:
     if cfg.readout != "lowrank":
         return cfg.readout_rank
     n, d, v = cfg.n_neurons, cfg.d_space, cfg.vocab_size
-    fixed = 2 * n * d + v * d + n + 2 + v
+    fixed = 2 * n * d + v * d + 2 * n + 3 + v
     if cfg.free_weights:
         fixed += n * cfg.k_max
     per_rank = n + 2 + v
@@ -115,6 +116,22 @@ class BrainLM(nn.Module):
             torch.tensor(math.log(cfg.sigma_init)), requires_grad=cfg.learn_sigma
         )
         self.gain = nn.Parameter(torch.tensor(1.0), requires_grad=cfg.homeostasis)
+
+        self.gate_logit = nn.Parameter(
+            torch.tensor(math.log(max(cfg.input_gate, 1e-6))),
+            requires_grad=cfg.learn_input_gate,
+        )
+
+        # Time constants laid out log-uniformly and, crucially, in band order:
+        # band b owns the contiguous slice [b*size, (b+1)*size), slowest first.
+        # The banded k-WTA relies on that contiguity to slice without gathering.
+        tau = torch.logspace(
+            math.log10(cfg.decay_tau_max), math.log10(cfg.decay_tau_min), n
+        )
+        decay0 = torch.exp(-1.0 / tau).clamp(1e-4, 1 - 1e-4)
+        self.decay_logit = nn.Parameter(
+            torch.log(decay0 / (1 - decay0)), requires_grad=cfg.learn_decay
+        )
 
         if cfg.free_weights:
             # Ablation: strengths are free parameters on a frozen topology.
@@ -275,21 +292,47 @@ class BrainLM(nn.Module):
         rms = state.pow(2).mean(-1, keepdim=True).add(EPS).sqrt()
         return state / rms * self.gain.float()
 
+    def decays(self) -> torch.Tensor:
+        """[N] per-neuron retention. Constant unless `learn_decay` is set."""
+        if not self.cfg.learn_decay:
+            return torch.full_like(self.decay_logit, self.cfg.decay)
+        return torch.sigmoid(self.decay_logit)
+
     def _kwta(self, state: torch.Tensor):
-        """Hard k-winners-take-all. Returns (sparse state, values, indices)."""
-        val, idx = state.topk(self.cfg.top_n, dim=-1)
+        """Hard k-winners-take-all. Returns (sparse state, values, indices).
+
+        With `n_bands > 1` the budget is split evenly across contiguous bands
+        rather than competed for globally. Slow neurons retain magnitude by
+        construction, so a global top-k hands them every slot permanently and
+        the fast neurons -- the ones that track the current clause -- starve.
+        """
+        cfg = self.cfg
+        if cfg.n_bands <= 1:
+            val, idx = state.topk(cfg.top_n, dim=-1)
+        else:
+            b = state.shape[0]
+            band = cfg.n_neurons // cfg.n_bands
+            per = cfg.top_n // cfg.n_bands
+            v, i = state.view(b, cfg.n_bands, band).topk(per, dim=-1)
+            offset = torch.arange(cfg.n_bands, device=state.device).view(1, -1, 1) * band
+            val = v.reshape(b, -1)
+            idx = (i + offset).reshape(b, -1)
         sparse = torch.zeros_like(state).scatter(1, idx, val)
         return sparse, val, idx
 
-    def _propagate(self, state: torch.Tensor, w_all: torch.Tensor, signs: torch.Tensor):
+    def _propagate(self, state: torch.Tensor, w_all: torch.Tensor,
+                   signs: torch.Tensor, decay: torch.Tensor):
         cfg = self.cfg
         b = state.shape[0]
         state, val, idx = self._kwta(state)
 
         # Adaptive compute: a neuron's fan-out scales with how strongly it fired,
         # normalised against the strongest neuron in the same batch row so the
-        # rule is invariant to the overall activation scale.
-        frac = (val / val[:, :1].clamp_min(EPS)).clamp(0.0, 1.0)
+        # rule is invariant to the overall activation scale. Taken as an explicit
+        # max rather than val[:, 0] because banded selection is sorted within a
+        # band but not across bands.
+        peak = val.max(dim=-1, keepdim=True).values.clamp_min(EPS)
+        frac = (val / peak).clamp(0.0, 1.0)
         k_i = cfg.k_min + torch.floor(frac * (cfg.k_max - cfg.k_min + 1)).clamp(
             max=cfg.k_max - cfg.k_min
         )                                                        # [B, P]
@@ -308,12 +351,15 @@ class BrainLM(nn.Module):
         arrived = torch.zeros_like(state).scatter_add(
             1, nbr.reshape(b, -1), signal.reshape(b, -1)
         )
-        out = self._homeostasis(self._activate(cfg.decay * state + arrived))
+        out = self._homeostasis(self._activate(decay.unsqueeze(0) * state + arrived))
         return out, idx, k_i
 
     def step(self, tok: torch.Tensor, state: torch.Tensor, w_all: torch.Tensor,
-             signs: torch.Tensor, stats: dict | None = None) -> torch.Tensor:
+             signs: torch.Tensor, stats: dict | None = None,
+             decay: torch.Tensor | None = None) -> torch.Tensor:
         cfg = self.cfg
+        if decay is None:
+            decay = self.decays()
         p = self.tok_pos(tok)                                    # [B, d]
 
         # Squared distance from the injected point to every dendrite.
@@ -323,7 +369,28 @@ class BrainLM(nn.Module):
 
         sv, si = (-sq).topk(cfg.seed_n, dim=-1)
         seed = torch.zeros_like(state).scatter(1, si, self.kernel(-sv))
-        state = self._homeostasis(cfg.decay * state + seed)
+
+        # Match the seed to the state's scale before mixing. Raw kernel values
+        # live in (0, 1] while a homeostatically normalised state carries
+        # sqrt(N / top_n) per active neuron -- about 12x larger at the reference
+        # config. Adding them directly makes the k-WTA discard ~93% of every
+        # token's seeds, so the state coasts on whatever entered first instead of
+        # integrating the sequence.
+        seed = seed / seed.pow(2).mean(-1, keepdim=True).add(EPS).sqrt()
+
+        # Write rate is coupled to each neuron's own decay, which makes this an
+        # exponential moving average per neuron: x <- d*x + (1-d)*u. A single
+        # global gate cannot work here -- setting it high enough for fast
+        # neurons to track the current token makes every token overwrite the
+        # slow ones too, which is how retention collapsed from 14 tokens to 3
+        # when the injection scale alone was fixed. Coupling makes a tau=250
+        # neuron accept 0.4% per token and hold, while a tau=1.5 neuron accepts
+        # half and tracks. Steady-state magnitudes still match across bands,
+        # since an EMA converges to the mean of its input either way.
+        write = self.gate_logit.exp() * (1.0 - decay)             # [N]
+        state = self._homeostasis(
+            decay.unsqueeze(0) * state + write.unsqueeze(0) * seed
+        )
 
         if stats is not None:
             # Switch-style load balance, measured where routing actually happens.
@@ -338,7 +405,7 @@ class BrainLM(nn.Module):
             stats["n_tok"] = stats.get("n_tok", 0) + 1
 
         for _ in range(cfg.rounds):
-            state, idx, k_i = self._propagate(state, w_all, signs)
+            state, idx, k_i = self._propagate(state, w_all, signs, decay)
             if stats is not None:
                 stats["k_sum"] = stats.get("k_sum", 0.0) + k_i.mean()
                 stats["k_count"] = stats.get("k_count", 0) + 1
@@ -357,12 +424,14 @@ class BrainLM(nn.Module):
 
     def readout(self, state: torch.Tensor) -> torch.Tensor:
         cfg = self.cfg
+        # Routed through _kwta so the readout sees the same active set the
+        # dynamics do; a plain global top-k would ignore the band budget.
         if cfg.readout == "lowrank":
-            val, idx = state.topk(cfg.top_n, dim=-1)
+            _, val, idx = self._kwta(state)
             h = (self.r_in[idx] * val.unsqueeze(-1)).sum(1)      # [B, r]
             return self.r_out(self.r_norm(h))
         if cfg.readout == "geometric":
-            val, idx = state.topk(cfg.top_n, dim=-1)
+            _, val, idx = self._kwta(state)
             w = val / val.sum(-1, keepdim=True).clamp_min(EPS)
             centroid = (self.axon[idx] * w.unsqueeze(-1)).sum(1)  # [B, d]
             sq = torch.cdist(centroid, self.out_pos).pow(2)       # [B, V]
@@ -382,11 +451,12 @@ class BrainLM(nn.Module):
 
         w_all = self.edge_weights()
         signs = self.signs()
+        decay = self.decays()
         stats: dict | None = {} if collect_stats else None
 
         logits = []
         for i in range(t):
-            state = self.step(x[:, i], state, w_all, signs, stats)
+            state = self.step(x[:, i], state, w_all, signs, stats, decay)
             logits.append(self.readout(state))
         return torch.stack(logits, dim=1), state, (stats or {})
 
