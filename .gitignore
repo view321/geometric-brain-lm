@@ -1,0 +1,17 @@
+# Generated data. Rebuild with prep_data.py; see the README quickstart.
+data/
+data_smoke/
+raw/
+
+# Training output: checkpoints, logs, reports.
+runs/
+runs_*/
+*.pt
+*.bin
+
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.ipynb_checkpoints/
+.DS_Store

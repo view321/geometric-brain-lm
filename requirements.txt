@@ -1,0 +1,9 @@
+# Training and evaluation need only these three.
+torch>=2.1
+numpy>=1.24
+tokenizers>=0.15
+
+# Optional, and only for prep_data.py: it is the first of three ways the script
+# tries to obtain TinyStories. Without it, prep_data.py falls back to a direct
+# HTTPS download, and then to a synthetic corpus for offline smoke testing.
+# datasets>=2.14
