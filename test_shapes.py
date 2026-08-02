@@ -99,7 +99,7 @@ def test_sparsity_and_k() -> None:
     w, s = model.edge_weights(), model.signs()
     stats: dict = {}
     for t in range(6):
-        state = model.step(torch.randint(0, cfg.vocab_size, (2,)), state, w, s, stats)
+        state, _ = model.step(torch.randint(0, cfg.vocab_size, (2,)), state, w, s, stats)
 
     sparse, val, idx = model._kwta(state)
     check("k-WTA keeps exactly top_n", int((sparse != 0).sum(-1).max()) <= cfg.top_n)
@@ -122,7 +122,7 @@ def test_long_horizon_stability() -> None:
     norms = []
     with torch.no_grad():
         for t in range(256):
-            state = model.step(torch.randint(0, cfg.vocab_size, (2,)), state, w, s)
+            state, _ = model.step(torch.randint(0, cfg.vocab_size, (2,)), state, w, s)
             norms.append(float(state.norm()))
     check("finite after 256 tokens", all(math.isfinite(v) for v in norms))
     check("no runaway growth", max(norms) < 20 * (norms[8] + 1e-6),
@@ -264,12 +264,87 @@ def test_legacy_checkpoint() -> None:
             check("corrupt checkpoint still raises", True)
 
 
+def test_latent_reasoning() -> None:
+    """Deep supervision, halting and predictive coding each do what they claim."""
+    print("\nlatent-reasoning mechanisms")
+    rounds = 4
+    base = dict(rounds=rounds, k_min=1, inject_every_round=True)
+
+    # --- deep supervision -------------------------------------------------
+    cfg = tiny(deep_supervision=0.5, **base)
+    model = BrainLM(cfg)
+    model.train()
+    x = torch.randint(0, cfg.vocab_size, (3, 5))
+    logits, _, stats = model(x)
+    deep = stats.get("deep")
+    check("deep logits produced", deep is not None)
+    check("deep logits aligned with targets",
+          deep is not None and deep.shape == logits.shape,
+          f"{None if deep is None else tuple(deep.shape)} vs {tuple(logits.shape)}")
+    # Supervising an intermediate depth must not be the same tensor as the final
+    # output, or it is supervising nothing.
+    check("deep differs from final output",
+          deep is not None and not torch.allclose(deep, logits))
+    model.eval()
+    _, _, s_eval = model(x)
+    check("deep supervision is training-only", s_eval.get("deep") is None)
+
+    # --- halting ----------------------------------------------------------
+    cfg = tiny(halting=True, **base)
+    model = BrainLM(cfg)
+    model.train()
+    _, _, stats = model(x)
+    depth = float(model.latent_losses(stats, x)["ponder"].detach())
+    check("expected depth within [1, rounds]", 1.0 <= depth <= rounds,
+          f"depth={depth:.3f}")
+    with torch.no_grad():
+        model.halt_head.bias.fill_(8.0)          # halt at the first opportunity
+    _, _, stats = model(x)
+    early = float(model.latent_losses(stats, x)["ponder"].detach())
+    check("halting early collapses expected depth", early < 1.05,
+          f"depth={early:.3f}")
+    with torch.no_grad():
+        model.halt_head.bias.fill_(-8.0)         # never halt voluntarily
+    _, _, stats = model(x)
+    late = float(model.latent_losses(stats, x)["ponder"].detach())
+    check("refusing to halt runs to the last round", late > rounds - 0.05,
+          f"depth={late:.3f}")
+
+    # --- predictive coding ------------------------------------------------
+    cfg = tiny(predictive_coding=True, **base)
+    model = BrainLM(cfg)
+    model.train()
+    _, _, stats = model(x)
+    check("reconstruction loss produced", stats.get("recon_n", 0) > 0)
+    recon = model.latent_losses(stats, x)["recon"]
+    check("reconstruction loss is finite and positive",
+          bool(torch.isfinite(recon)) and float(recon) > 0)
+    check("reconstruction head has a gradient path",
+          bool(torch.autograd.grad(recon, model.recon_head.weight,
+                                   retain_graph=True)[0].abs().sum() > 0))
+
+    # --- all three together -----------------------------------------------
+    cfg = tiny(deep_supervision=0.5, halting=True, predictive_coding=True, **base)
+    model = BrainLM(cfg)
+    model.train()
+    logits, _, stats = model(x)
+    aux = model.latent_losses(stats, x)
+    total = (F.cross_entropy(logits.reshape(-1, cfg.vocab_size), x.reshape(-1))
+             + 0.5 * aux["deep"] + 0.01 * aux["ponder"] + 0.1 * aux["recon"])
+    total.backward()
+    dead = [n for n, p in model.named_parameters()
+            if p.requires_grad and (p.grad is None or not p.grad.abs().sum() > 0)]
+    check("all three combined: every parameter gets gradient", not dead, f"dead: {dead}")
+    check("combined param count matches", param_count(cfg)
+          == sum(p.numel() for p in model.parameters()))
+
+
 def main() -> int:
     torch.manual_seed(0)
     for fn in (test_param_count, test_knn, test_gradients, test_sparsity_and_k,
                test_long_horizon_stability, test_autocast_state_dtype,
                test_reseed, test_frozen_control, test_no_weight_decay_on_geometry,
-               test_legacy_checkpoint):
+               test_legacy_checkpoint, test_latent_reasoning):
         fn()
     print()
     if FAILURES:

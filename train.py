@@ -151,6 +151,7 @@ def train(cfg, args) -> dict:
         optimizer.zero_grad(set_to_none=True)
         state = model.init_state(tc.batch_size, device)
         step_loss, step_balance = 0.0, 0.0
+        step_aux = {"deep": 0.0, "ponder": 0.0, "recon": 0.0}
 
         for start in range(0, x.shape[1], chunk):
             xc = x[:, start:start + chunk]
@@ -169,6 +170,15 @@ def train(cfg, args) -> dict:
                 balance = model.balance_loss(stats)
                 total = total + tc.balance_coef * balance
                 step_balance += float(balance.detach()) / n_chunks
+            if is_brain:
+                aux = model.latent_losses(stats, yc)
+                bc = cfg.brain
+                total = (total
+                         + bc.deep_supervision * aux["deep"]
+                         + bc.ponder_coef * aux["ponder"]
+                         + bc.recon_coef * aux["recon"])
+                for key in ("deep", "ponder", "recon"):
+                    step_aux[key] += float(aux[key].detach()) / n_chunks
 
             (total / n_chunks).backward()
             state = detach_state(state)
@@ -213,6 +223,13 @@ def train(cfg, args) -> dict:
                 record["dead_frac"] = float((model.usage == 0).float().mean())
                 if stats.get("k_count"):
                     record["mean_k"] = float(stats["k_sum"]) / stats["k_count"]
+                bc = cfg.brain
+                if bc.deep_supervision > 0:
+                    record["deep_loss"] = step_aux["deep"]
+                if bc.halting:
+                    record["ponder"] = step_aux["ponder"]
+                if bc.predictive_coding:
+                    record["recon_loss"] = step_aux["recon"]
             logger.write(record)
             # Rate over the whole run, not the logging window's step count over
             # the total elapsed time -- that mixes a ~20-step numerator with a
@@ -224,6 +241,9 @@ def train(cfg, args) -> dict:
                   f"  {tps:>7.0f} tok/s"
                   + (f"  K {record.get('mean_k', 0):.1f}"
                      f"  dead {record.get('dead_frac', 0):.3f}" if is_brain else "")
+                  + (f"  ponder {record['ponder']:.2f}" if "ponder" in record else "")
+                  + (f"  recon {record['recon_loss']:.3f}"
+                     if "recon_loss" in record else "")
                   + f"  eta {eta / 3600:.1f}h")
             window_loss, window_n = 0.0, 0
 

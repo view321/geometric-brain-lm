@@ -109,6 +109,44 @@ class BrainConfig:
     # timescale a fixed share of the active set. 1 = plain global top-k.
     n_bands: int = 1
 
+    # ------------------------------------------------------------------
+    # Latent reasoning. Three mechanisms that could make extra iterations
+    # constructive rather than merely tolerated.
+    #
+    # Measured motivation: the state settles cleanly (step size falls 0.247 ->
+    # 0.016 over 24 rounds) but perplexity is minimised at the trained depth and
+    # rises on both sides. The dynamics converge; they converge on something
+    # uninformative. Depth cannot help until iteration N+1 is more correct than
+    # N, and diffusion toward a fixed point gives no reason for that.
+    # ------------------------------------------------------------------
+
+    # Loss applied at a sampled intermediate round in addition to the last, so
+    # every intermediate state has to be decodable. This is what makes depth
+    # monotone: a state that is not yet an answer is penalised for it. One
+    # random depth per forward rather than all of them keeps the cost at 2x
+    # instead of Rx, and is unbiased in expectation.
+    deep_supervision: float = 0.0
+
+    # Adaptive Computation Time. A halting head reads each round's state and
+    # emits the probability of stopping there; the output is the halt-weighted
+    # mixture over rounds, and `ponder_coef` prices expected depth. Without a
+    # price the model always halts late; with too high a price it always halts
+    # at one. This is how the model learns to *spend* time instead of having a
+    # fixed amount imposed on it.
+    halting: bool = False
+    ponder_coef: float = 0.01
+
+    # Predictive coding. A reconstruction head must recover the current token
+    # from the state, and the injection at each round is scaled by how badly it
+    # currently fails to. A state that already explains its input stops being
+    # driven; one that does not keeps being corrected. This makes iteration a
+    # descent on prediction error, and -- the point -- makes the fixed point the
+    # state that explains the input, rather than whatever the diffusion happens
+    # to land on.
+    predictive_coding: bool = False
+    recon_coef: float = 0.1
+    pc_floor: float = 0.1        # injection retained when fully unsurprised
+
     kernel: str = "gaussian"     # gaussian | cauchy
     sigma_init: float = 1.0
     learn_sigma: bool = True
@@ -361,6 +399,49 @@ def _think() -> RunConfig:
     return cfg
 
 
+def _think_deep() -> RunConfig:
+    """`think` plus deep supervision. Cheapest of the three, most likely to work."""
+    cfg = _think()
+    cfg.name = "think-deep"
+    cfg.brain.deep_supervision = 0.5
+    return cfg
+
+
+def _think_act() -> RunConfig:
+    """`think` plus a halting head and a ponder cost."""
+    cfg = _think()
+    cfg.name = "think-act"
+    cfg.brain.halting = True
+    cfg.brain.ponder_coef = 0.01
+    cfg.train.tbptt_chunk = 16     # halting keeps a readout per round in the graph
+    return cfg
+
+
+def _think_pc() -> RunConfig:
+    """`think` plus predictive-coding dynamics."""
+    cfg = _think()
+    cfg.name = "think-pc"
+    cfg.brain.predictive_coding = True
+    cfg.brain.recon_coef = 0.1
+    cfg.train.tbptt_chunk = 16
+    return cfg
+
+
+def _think_all() -> RunConfig:
+    """All three at once.
+
+    Run the single-mechanism presets first. If this wins, it cannot say which
+    mechanism won, and if it loses it cannot say which one is at fault.
+    """
+    cfg = _think()
+    cfg.name = "think-all"
+    cfg.brain.deep_supervision = 0.5
+    cfg.brain.halting = True
+    cfg.brain.predictive_coding = True
+    cfg.train.tbptt_chunk = 8
+    return cfg
+
+
 def _frozen2() -> RunConfig:
     """The echo-state control for `ref2`. A control has to share the
     architecture it controls for, so this tracks ref2 rather than ref."""
@@ -413,6 +494,10 @@ PRESETS = {
     "freeweight2": _free_weights2,
     "frozen2": _frozen2,
     "think": _think,
+    "think-deep": _think_deep,
+    "think-act": _think_act,
+    "think-pc": _think_pc,
+    "think-all": _think_all,
     "gru": _gru,
     "transformer": _transformer,
 }

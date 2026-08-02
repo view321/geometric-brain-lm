@@ -54,6 +54,10 @@ def param_count(cfg: BrainConfig) -> int:
     total += 3                 # log_sigma, gain, input gate
     if cfg.free_weights:
         total += n * cfg.k_max
+    if cfg.halting:
+        total += cfg.readout_rank + 1                      # halt head
+    if cfg.predictive_coding:
+        total += cfg.readout_rank * v + v                  # reconstruction head
     if cfg.readout == "lowrank":
         r = cfg.readout_rank
         total += n * r + 2 * r + r * v + v
@@ -151,6 +155,17 @@ class BrainLM(nn.Module):
             self.free_w = nn.Parameter(torch.rand(n, cfg.k_max) * 0.5 + 0.5)
 
         self._build_readout()
+
+        # Latent-reasoning heads. Both read the pooled readout features, so they
+        # cost r*(1+V) parameters rather than anything proportional to N.
+        if cfg.halting:
+            self.halt_head = nn.Linear(cfg.readout_rank, 1)
+            # Start biased toward not halting, so early training sees full depth
+            # and the ponder cost pulls it down rather than the model collapsing
+            # to one round before it has learned anything worth iterating on.
+            nn.init.constant_(self.halt_head.bias, -2.0)
+        if cfg.predictive_coding:
+            self.recon_head = nn.Linear(cfg.readout_rank, cfg.vocab_size)
 
         self.register_buffer("knn_idx", torch.zeros(n, cfg.k_max, dtype=torch.int32))
         self.register_buffer("usage", torch.zeros(n))
@@ -446,12 +461,60 @@ class BrainLM(nn.Module):
             stats["f_sum"] = stats.get("f_sum", 0.0) + hits
             stats["n_tok"] = stats.get("n_tok", 0) + 1
 
+        n_rounds = cfg.rounds if rounds is None else rounds
         recur = injection if cfg.inject_every_round else None
-        for r in range(cfg.rounds if rounds is None else rounds):
+
+        want_logits = cfg.halting or (cfg.deep_supervision > 0 and self.training)
+        deep_pick = -1
+        if cfg.deep_supervision > 0 and self.training and n_rounds > 1:
+            deep_pick = int(torch.randint(0, n_rounds - 1, (1,)).item())
+
+        remain = None          # P(not yet halted); None until halting starts
+        mixed = None           # halt-weighted logit mixture
+        if cfg.halting:
+            remain = torch.ones(state.shape[0], 1, device=state.device)
+
+        for r in range(n_rounds):
             step_inject = recur
             if recur is not None and cfg.inject_decay != 1.0:
                 step_inject = recur * (cfg.inject_decay ** r)
+
+            if cfg.predictive_coding and step_inject is not None:
+                # Precision-weighted prediction error: drive the state in
+                # proportion to how badly it currently fails to account for the
+                # token it is holding. A state that already explains its input
+                # stops being pushed, which is what turns iteration into descent
+                # rather than continued stirring.
+                recon = self.recon_head(self.readout_features(state))
+                p_true = torch.softmax(recon.float(), dim=-1).gather(
+                    1, tok.view(-1, 1)).clamp(0.0, 1.0)
+                surprise = (cfg.pc_floor + (1.0 - p_true)).to(step_inject.dtype)
+                step_inject = step_inject * surprise
+                if stats is not None:
+                    stats["recon_nll"] = stats.get("recon_nll", 0.0) + F.cross_entropy(
+                        recon.float(), tok)
+                    stats["recon_n"] = stats.get("recon_n", 0) + 1
+
             state, idx, k_i = self._propagate(state, w_all, signs, decay, step_inject)
+
+            if want_logits:
+                feats = self.readout_features(state)     # shared by both heads
+                logits_r = self.r_out(feats)
+                if cfg.halting:
+                    if r == n_rounds - 1:
+                        p_r = remain                     # remainder: must stop
+                    else:
+                        p_r = remain * torch.sigmoid(self.halt_head(feats))
+                        remain = remain - p_r
+                    mixed = p_r * logits_r if mixed is None else mixed + p_r * logits_r
+                    if stats is not None:
+                        # Expected depth for this token: sum_r p_r * (r+1), which
+                        # lies in [1, R] because the p_r sum to one. Counted once
+                        # per token below, not once per round.
+                        depth = stats.get("ponder", 0.0) + p_r.mean() * (r + 1)
+                        stats["ponder"] = depth
+                if r == deep_pick and stats is not None:
+                    stats.setdefault("deep_logits", []).append(logits_r)
             if stats is not None:
                 stats["k_sum"] = stats.get("k_sum", 0.0) + k_i.mean()
                 stats["k_count"] = stats.get("k_count", 0) + 1
@@ -462,20 +525,33 @@ class BrainLM(nn.Module):
                         torch.ones(idx.numel(), device=state.device),
                     )
                     stats["fired"] = stats.get("fired", 0.0) + fired
-        return state
+
+        if cfg.halting and stats is not None:
+            stats["ponder_n"] = stats.get("ponder_n", 0) + 1     # one per token
+        # `mixed` is the halt-weighted output when halting is on; forward uses it
+        # in place of a plain readout of the final state.
+        return state, mixed
 
     # ------------------------------------------------------------------
     # readout
     # ------------------------------------------------------------------
+
+    def readout_features(self, state: torch.Tensor) -> torch.Tensor:
+        """[B, r] pooled description of the state, before the vocab projection.
+
+        Split out because the halting head, the reconstruction head and the
+        vocab head all read the same summary, and an intermediate round may
+        need it without paying for the [B, V] projection.
+        """
+        _, val, idx = self._kwta(state)
+        return self.r_norm((self.r_in[idx] * val.unsqueeze(-1)).sum(1))
 
     def readout(self, state: torch.Tensor) -> torch.Tensor:
         cfg = self.cfg
         # Routed through _kwta so the readout sees the same active set the
         # dynamics do; a plain global top-k would ignore the band budget.
         if cfg.readout == "lowrank":
-            _, val, idx = self._kwta(state)
-            h = (self.r_in[idx] * val.unsqueeze(-1)).sum(1)      # [B, r]
-            return self.r_out(self.r_norm(h))
+            return self.r_out(self.readout_features(state))
         if cfg.readout == "geometric":
             _, val, idx = self._kwta(state)
             w = val / val.sum(-1, keepdim=True).clamp_min(EPS)
@@ -501,11 +577,22 @@ class BrainLM(nn.Module):
         rounds = self.sample_rounds()
         stats: dict | None = {} if collect_stats else None
 
-        logits = []
+        logits, deep = [], []
         for i in range(t):
-            state = self.step(x[:, i], state, w_all, signs, stats, decay, rounds)
-            logits.append(self.readout(state))
-        return torch.stack(logits, dim=1), state, (stats or {})
+            if stats is not None:
+                stats.pop("deep_logits", None)
+            state, mixed = self.step(x[:, i], state, w_all, signs, stats,
+                                     decay, rounds)
+            logits.append(mixed if mixed is not None else self.readout(state))
+            if stats is not None and stats.get("deep_logits"):
+                deep.append(stats.pop("deep_logits")[0])
+
+        out = (stats or {})
+        if deep and len(deep) == t:
+            # [B, T, V] at a sampled intermediate depth, aligned with the targets
+            # so the trainer can score it with the same cross-entropy.
+            out["deep"] = torch.stack(deep, dim=1)
+        return torch.stack(logits, dim=1), state, out
 
     # ------------------------------------------------------------------
     # auxiliary loss and neuron rescue
@@ -526,6 +613,32 @@ class BrainLM(nn.Module):
         p = stats["p_sum"] / n_tok
         f = stats["f_sum"] / n_tok
         return self.cfg.n_neurons * (p * f).sum()
+
+    def latent_losses(self, stats: dict, targets: torch.Tensor) -> dict:
+        """Auxiliary losses for the three latent-reasoning mechanisms.
+
+        Returned separately rather than summed so the trainer can log each and
+        see which one is actually doing anything -- a combined number would hide
+        a mechanism that is contributing nothing but cost.
+        """
+        cfg = self.cfg
+        zero = torch.zeros((), device=self.axon.device)
+        out = {"deep": zero, "ponder": zero, "recon": zero}
+        if not stats:
+            return out
+
+        if cfg.deep_supervision > 0 and stats.get("deep") is not None:
+            d = stats["deep"]
+            out["deep"] = F.cross_entropy(
+                d.float().reshape(-1, d.shape[-1]), targets.reshape(-1))
+        if cfg.halting and stats.get("ponder_n"):
+            # Expected depth, averaged over the tokens in this forward. Pricing
+            # it is what makes halting mean anything: with no cost the model
+            # always runs to the last round and the head learns nothing.
+            out["ponder"] = stats["ponder"] / max(stats["ponder_n"], 1)
+        if cfg.predictive_coding and stats.get("recon_n"):
+            out["recon"] = stats["recon_nll"] / max(stats["recon_n"], 1)
+        return out
 
     @torch.no_grad()
     def update_usage(self, stats: dict, ema: float = 0.99) -> None:

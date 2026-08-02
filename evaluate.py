@@ -334,7 +334,7 @@ def compute_scaling(model, stream, *, batch_size: int, seq_len: int, tbptt: int,
     w, signs, dec = model.edge_weights(), model.signs(), model.decays()
     state = model.init_state(x.shape[0], device)
     for t in range(min(16, seq_len)):          # warm the state on real context
-        state = model.step(x[:, t], state, w, signs, None, dec, model.cfg.rounds)
+        state, _ = model.step(x[:, t], state, w, signs, None, dec, model.cfg.rounds)
     deltas = []
     prev = state
     for _ in range(max(rounds)):
@@ -493,10 +493,10 @@ def memory_horizon(model, *, tokens: int = 128, trials: int = 16,
         state = model.init_state(1, device)
         # Warm the state so the probe lands in a populated system, not an empty one.
         for _ in range(16):
-            state = model.step(rand_tok(), state, w, signs, None, dec)
+            state, _ = model.step(rand_tok(), state, w, signs, None, dec)
 
         probe = rand_tok()
-        state = model.step(probe, state, w, signs, None, dec)
+        state, _ = model.step(probe, state, w, signs, None, dec)
         tracked = model._kwta(state)[2][0]
         tset = set(tracked.tolist())
         bands = [{i for i in tset if i // band == b} for b in range(cfg.n_bands)]
@@ -509,7 +509,7 @@ def memory_horizon(model, *, tokens: int = 128, trials: int = 16,
                   + model.dend.pow(2).sum(-1).unsqueeze(0)).clamp_min(0.0)
             want = set((-sq).topk(cfg.seed_n, dim=-1).indices[0].tolist())
 
-            state = model.step(tok, state, w, signs, None, dec)
+            state, _ = model.step(tok, state, w, signs, None, dec)
             live = set(model._kwta(state)[2][0].tolist())
             entry.append(len(want & live) / max(len(want), 1))
             for b in range(cfg.n_bands):
@@ -601,7 +601,7 @@ def geometry_diagnostics(model, stream=None, *, batch_size: int = 8,
         for t in range(seq_len):
             stats: dict = {}
             w = model.edge_weights()
-            state = model.step(x[:, t], state, w, model.signs(), stats)
+            state, _ = model.step(x[:, t], state, w, model.signs(), stats)
             logits = model.readout(state)
             nll = F.cross_entropy(logits.float(), y[:, t], reduction="none")
             surprisal.append(nll)
