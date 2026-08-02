@@ -205,7 +205,9 @@ def memory_horizon(model, *, tokens: int = 128, trials: int = 16,
     band = cfg.n_neurons // cfg.n_bands
     curve = torch.zeros(tokens)
     per_band = torch.zeros(cfg.n_bands, tokens)
-    entry = []
+    entry: list[float] = []
+    band_entry = torch.zeros(cfg.n_bands)
+    band_entry_n = torch.zeros(cfg.n_bands)
 
     for tr in range(trials):
         state = model.init_state(1, device)
@@ -230,6 +232,11 @@ def memory_horizon(model, *, tokens: int = 128, trials: int = 16,
             state = model.step(tok, state, w, signs, None, dec)
             live = set(model._kwta(state)[2][0].tolist())
             entry.append(len(want & live) / max(len(want), 1))
+            for b in range(cfg.n_bands):
+                wb = {i for i in want if i // band == b}
+                if wb:
+                    band_entry[b] += len(wb & live) / len(wb)
+                    band_entry_n[b] += 1
             curve[t] += len(tset & live) / max(len(tset), 1) / trials
             for b in range(cfg.n_bands):
                 if bands[b]:
@@ -252,6 +259,14 @@ def memory_horizon(model, *, tokens: int = 128, trials: int = 16,
         out["band_half_life"] = [half_life(per_band[b]) for b in range(cfg.n_bands)]
         out["band_tau_median"] = [
             float(tau[b * band:(b + 1) * band].median()) for b in range(cfg.n_bands)
+        ]
+        # Read this instead of the pooled figure on a banded model. Slow bands
+        # decline the current token by design, so pooling them with the fast
+        # bands makes a healthy model look like it has stopped listening. What
+        # matters is that the fastest band is high.
+        out["band_entry"] = [
+            float(band_entry[b] / band_entry_n[b].clamp_min(1))
+            for b in range(cfg.n_bands)
         ]
     return out
 

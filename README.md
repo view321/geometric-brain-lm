@@ -232,6 +232,16 @@ it is using about 6% of its window, and generated text will be locally fluent
 while losing entities across a sentence. Check the horizon before concluding
 anything from a sample that reads incoherent.
 
+On a banded model read `band_entry`, not the pooled `current_token_entry`. Slow
+bands decline the current token by design, so pooling them with the fast bands
+makes a healthy model look like it has stopped listening. A healthy banded model
+is monotonic in both: entry falls and half-life rises as you go from the fast
+band to the slow one.
+
+Checkpoints trained before the injection fix load automatically with
+`legacy_injection=True` and print a notice. Their metrics then describe the
+model as it was trained rather than new dynamics wearing old weights.
+
 The `ref2` preset is `ref` with the injection scale fixed, a spread of time
 constants from ~1.5 to ~250 tokens, and the k-WTA budget split across four
 timescale bands so that slow neurons are not evicted by fast ones.

@@ -210,11 +210,66 @@ def test_no_weight_decay_on_geometry() -> None:
     check("readout is decayed", any(id(model.r_in) == id(p) for p in decay["params"]))
 
 
+def test_legacy_checkpoint() -> None:
+    """Checkpoints predating the input-injection fix load as what they were."""
+    print("\npre-fix checkpoints load with pre-fix dynamics")
+    import os
+    import tempfile
+
+    from checkpoint import load_model, save_checkpoint
+    from config import RunConfig
+
+    cfg = RunConfig(name="legacy", model="brain")
+    cfg.brain = tiny()
+    model = BrainLM(cfg.brain)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "old.pt")
+        save_checkpoint(path, model, None, cfg, step=0)
+
+        # Rewrite it as a pre-fix checkpoint: drop the two parameters that did
+        # not exist then, and the config fields that came with them.
+        blob = torch.load(path, map_location="cpu", weights_only=False)
+        for key in ("gate_logit", "decay_logit"):
+            blob["model"].pop(key, None)
+        for key in ("input_gate", "learn_input_gate", "legacy_injection",
+                    "learn_decay", "decay_tau_min", "decay_tau_max", "n_bands"):
+            blob["config"]["brain"].pop(key, None)
+        torch.save(blob, path)
+
+        loaded, loaded_cfg = load_model(path, device="cpu")
+        check("loads without error", loaded is not None)
+        check("legacy injection enabled", loaded_cfg.brain.legacy_injection)
+        check("timescales disabled", not loaded_cfg.brain.learn_decay)
+        check("banding disabled", loaded_cfg.brain.n_bands == 1)
+
+        # The whole point: it must behave like the old code, not the new code.
+        x = torch.randint(0, cfg.brain.vocab_size, (2, 5))
+        with torch.no_grad():
+            a = loaded(x, collect_stats=False)[0]
+            reference = BrainLM(loaded_cfg.brain)
+            reference.load_state_dict(loaded.state_dict())
+            reference.eval()
+            b = reference(x, collect_stats=False)[0]
+        check("reproducible forward", bool(torch.allclose(a, b, atol=1e-5)))
+
+        # A genuinely broken checkpoint must still fail loudly.
+        blob = torch.load(path, map_location="cpu", weights_only=False)
+        blob["model"].pop("r_in", None)
+        torch.save(blob, path)
+        try:
+            load_model(path, device="cpu")
+            check("corrupt checkpoint still raises", False, "no error raised")
+        except RuntimeError:
+            check("corrupt checkpoint still raises", True)
+
+
 def main() -> int:
     torch.manual_seed(0)
     for fn in (test_param_count, test_knn, test_gradients, test_sparsity_and_k,
                test_long_horizon_stability, test_autocast_state_dtype,
-               test_reseed, test_frozen_control, test_no_weight_decay_on_geometry):
+               test_reseed, test_frozen_control, test_no_weight_decay_on_geometry,
+               test_legacy_checkpoint):
         fn()
     print()
     if FAILURES:

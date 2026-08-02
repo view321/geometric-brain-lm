@@ -376,21 +376,29 @@ class BrainLM(nn.Module):
         # config. Adding them directly makes the k-WTA discard ~93% of every
         # token's seeds, so the state coasts on whatever entered first instead of
         # integrating the sequence.
-        seed = seed / seed.pow(2).mean(-1, keepdim=True).add(EPS).sqrt()
-
-        # Write rate is coupled to each neuron's own decay, which makes this an
-        # exponential moving average per neuron: x <- d*x + (1-d)*u. A single
-        # global gate cannot work here -- setting it high enough for fast
-        # neurons to track the current token makes every token overwrite the
-        # slow ones too, which is how retention collapsed from 14 tokens to 3
-        # when the injection scale alone was fixed. Coupling makes a tau=250
-        # neuron accept 0.4% per token and hold, while a tau=1.5 neuron accepts
-        # half and tracks. Steady-state magnitudes still match across bands,
-        # since an EMA converges to the mean of its input either way.
-        write = self.gate_logit.exp() * (1.0 - decay)             # [N]
-        state = self._homeostasis(
-            decay.unsqueeze(0) * state + write.unsqueeze(0) * seed
-        )
+        if cfg.legacy_injection:
+            # The pre-fix path, kept bit-for-bit so checkpoints trained before
+            # the fix can still be measured as the models they actually are.
+            # Everything else in this class is already backward compatible: with
+            # n_bands=1 the banded k-WTA is a plain top-k, and with
+            # learn_decay=False `decays()` is a constant vector equal to
+            # cfg.decay.
+            state = self._homeostasis(decay.unsqueeze(0) * state + seed)
+        else:
+            seed = seed / seed.pow(2).mean(-1, keepdim=True).add(EPS).sqrt()
+            # Write rate is coupled to each neuron's own decay, which makes this
+            # an exponential moving average per neuron: x <- d*x + (1-d)*u. A
+            # single global gate cannot work here -- setting it high enough for
+            # fast neurons to track the current token makes every token overwrite
+            # the slow ones too, which is how retention collapsed from 14 tokens
+            # to 3 when the injection scale alone was fixed. Coupling makes a
+            # tau=250 neuron accept 0.4% per token and hold, while a tau=1.5
+            # neuron accepts half and tracks. Steady-state magnitudes still match
+            # across bands, since an EMA converges to the mean of its input.
+            write = self.gate_logit.exp() * (1.0 - decay)         # [N]
+            state = self._homeostasis(
+                decay.unsqueeze(0) * state + write.unsqueeze(0) * seed
+            )
 
         if stats is not None:
             # Switch-style load balance, measured where routing actually happens.

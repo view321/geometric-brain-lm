@@ -54,6 +54,12 @@ class BrainConfig:
     input_gate: float = 1.0
     learn_input_gate: bool = True
 
+    # Reproduces the pre-fix injection exactly: raw un-normalized seed, no write
+    # gate. Set automatically when loading a checkpoint trained before the fix,
+    # so its metrics describe the model that was actually trained rather than a
+    # different model wearing its weights. Do not enable for new runs.
+    legacy_injection: bool = False
+
     # Per-neuron timescales. One global decay gives every neuron the same ~14
     # token horizon; a spread of time constants lets fast neurons carry syntax
     # while slow ones hold the protagonist. This is the mechanism behind S4 and
