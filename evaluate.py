@@ -34,7 +34,8 @@ def _detach(state):
 @torch.no_grad()
 def evaluate(model, stream, *, batch_size: int, seq_len: int, tbptt: int,
              max_batches: int = 0, tokenizer=None, split: str = "val",
-             autocast_dtype=None) -> dict:
+             autocast_dtype=None, range_start: int = 0,
+             range_stop: int | None = None) -> dict:
     """Teacher-forced held-out loss.
 
     Batches are consumed sequentially and the recurrent state is carried within
@@ -51,7 +52,9 @@ def evaluate(model, stream, *, batch_size: int, seq_len: int, tbptt: int,
            if autocast_dtype is not None else torch.enable_grad())
     use_ctx = autocast_dtype is not None
 
-    for i, (x, y) in enumerate(stream.sequential_batches(split, batch_size, seq_len)):
+    batches = stream.sequential_batches(split, batch_size, seq_len,
+                                        start=range_start, stop=range_stop)
+    for i, (x, y) in enumerate(batches):
         if max_batches and i >= max_batches:
             break
         state = model.init_state(x.shape[0], device)
@@ -170,6 +173,54 @@ def generate(model, tokenizer, prompt: str = "", *, max_new: int = 128,
     if was_training:
         model.train()
     return tokenizer.decode(out, skip_special_tokens=True)
+
+
+@torch.no_grad()
+def generalization_gap(model, stream, *, train_tokens: int, batch_size: int,
+                       seq_len: int, tbptt: int, batches: int = 100,
+                       tokenizer=None, autocast_dtype=None) -> dict:
+    """Score the exact slice the model trained on against the slice it never saw.
+
+    Both slices live inside train.bin and come from one corpus built in one
+    pass, so nothing distinguishes them but exposure -- no train/valid file
+    difference, no distribution shift, no tokenizer discrepancy. The difference
+    between them is memorisation, and the held-out number is generalisation.
+
+    This is the measurement that separates two parameterizations of equal
+    expressivity. A model with more free parameters can always fit the seen
+    slice harder; whether that costs it on the unseen slice is the only thing
+    that says which prior is better.
+    """
+    if train_tokens <= 0:
+        raise ValueError(
+            "generalization_gap needs the training cap; the checkpoint was "
+            "trained on the whole corpus, so there is no unseen slice to score")
+    total = stream.n_tokens("train")
+    if train_tokens >= total:
+        raise ValueError(
+            f"training cap {train_tokens:,} covers the whole {total:,}-token "
+            f"split; nothing was held out")
+
+    common = dict(batch_size=batch_size, seq_len=seq_len, tbptt=tbptt,
+                  max_batches=batches, tokenizer=tokenizer, split="train",
+                  autocast_dtype=autocast_dtype)
+    seen = evaluate(model, stream, range_start=0, range_stop=train_tokens, **common)
+    # Skip a seq_len of slack so no evaluation window straddles the boundary.
+    unseen = evaluate(model, stream, range_start=train_tokens + seq_len,
+                      range_stop=None, **common)
+
+    out = {
+        "seen_loss": seen["loss"], "seen_ppl": seen["ppl"],
+        "unseen_loss": unseen["loss"], "unseen_ppl": unseen["ppl"],
+        "gap_nats": unseen["loss"] - seen["loss"],
+        "gap_ppl_ratio": unseen["ppl"] / max(seen["ppl"], 1e-9),
+        "train_tokens": train_tokens,
+        "eval_tokens_each": seen["tokens"],
+    }
+    if "bpb" in seen and "bpb" in unseen:
+        out["seen_bpb"] = seen["bpb"]
+        out["unseen_bpb"] = unseen["bpb"]
+    return out
 
 
 @torch.no_grad()
@@ -417,6 +468,12 @@ def main() -> None:
     ap.add_argument("--induction", action="store_true",
                     help="in-context learning: can the model complete "
                          "A B ... A -> B from its own context?")
+    ap.add_argument("--gap", action="store_true",
+                    help="score the slice the model trained on against the "
+                         "slice it never saw, both inside train.bin. Needs a "
+                         "checkpoint trained with --train-tokens.")
+    ap.add_argument("--gap-batches", type=int, default=100,
+                    help="batches per side; the same count is used for both")
     ap.add_argument("--json", default=None, help="write metrics here")
     args = ap.parse_args()
 
@@ -443,6 +500,14 @@ def main() -> None:
         metrics.update(memory_horizon(model, trials=args.memory_trials))
     if args.induction:
         metrics.update(induction_probe(model))
+    if args.gap:
+        # The cap is recorded in the checkpoint, so the two slices are the ones
+        # this model actually saw and did not see.
+        metrics.update(generalization_gap(
+            model, stream, train_tokens=cfg.train.train_tokens,
+            batch_size=bs, seq_len=sl, tbptt=cfg.train.tbptt_chunk,
+            batches=args.gap_batches, tokenizer=tok,
+        ))
 
     print(json.dumps(metrics, indent=2, sort_keys=True))
     if args.json:

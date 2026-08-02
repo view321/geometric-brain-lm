@@ -117,19 +117,33 @@ class TokenStream:
             y[row] = window[1:]
         return self._to_device(x), self._to_device(y)
 
-    def sequential_batches(self, split: str, batch_size: int, seq_len: int):
-        """Deterministic non-overlapping generator over the whole split, for eval.
-        Yields (x, y) int64 [B, T]. Drops a final partial batch."""
+    def sequential_batches(self, split: str, batch_size: int, seq_len: int,
+                           start: int = 0, stop: int | None = None):
+        """Deterministic non-overlapping generator over a token range, for eval.
+
+        Yields (x, y) int64 [B, T]. Drops a final partial batch.
+
+        `start`/`stop` bound the region in tokens. Scoring a model on the exact
+        slice it trained on versus the slice it never saw is what separates
+        memorisation from generalisation, and with `train_limit` set those two
+        slices both live inside train.bin.
+        """
         arr = self._check(split, seq_len)
         if batch_size < 1:
             raise ValueError(f"batch_size must be >= 1, got {batch_size}")
-        n_windows = (arr.size - 1) // seq_len
+        stop = arr.size if stop is None else min(int(stop), arr.size)
+        start = max(int(start), 0)
+        if stop - start < seq_len + 1:
+            raise ValueError(
+                f"range [{start}, {stop}) in split {split!r} holds "
+                f"{max(stop - start, 0)} tokens, too few for seq_len={seq_len}")
+        n_windows = (stop - start - 1) // seq_len
         n_batches = n_windows // batch_size
         for b in range(n_batches):
             x = np.empty((batch_size, seq_len), dtype=np.int64)
             y = np.empty((batch_size, seq_len), dtype=np.int64)
             for row in range(batch_size):
-                i = (b * batch_size + row) * seq_len
+                i = start + (b * batch_size + row) * seq_len
                 window = np.asarray(arr[i:i + seq_len + 1], dtype=np.int64)
                 x[row] = window[:-1]
                 y[row] = window[1:]

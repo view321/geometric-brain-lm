@@ -168,7 +168,7 @@ def train(cfg, args) -> dict:
             if is_brain and tc.balance_coef > 0:
                 balance = model.balance_loss(stats)
                 total = total + tc.balance_coef * balance
-                step_balance += float(balance) / n_chunks
+                step_balance += float(balance.detach()) / n_chunks
 
             (total / n_chunks).backward()
             state = detach_state(state)
