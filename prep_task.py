@@ -65,6 +65,13 @@ def gen_sort(rng: random.Random, length: int) -> str:
 
 TASKS = {"parity": gen_parity, "copy": gen_copy, "sort": gen_sort}
 
+#: Token after which everything up to the next EOS is the answer. Recorded in
+#: meta.json so evaluation can score the task instead of the whole sequence.
+#: This matters most for parity, where the inputs are uniformly random bits:
+#: one token in ~19 carries the task, so sequence perplexity barely moves
+#: between solving it and not learning it at all.
+DELIMITERS = {"parity": "=", "copy": "|", "sort": ">"}
+
 
 def build_split(task: str, n: int, lo: int, hi: int, seed: int):
     rng = random.Random(seed)
@@ -120,6 +127,8 @@ def main() -> None:
         "source": f"synthetic:{args.task}", "tokenizer_file": "tok8k.json",
         "task": args.task, "train_len": [args.min_len, args.max_len],
         "val_len": [args.min_len, val_hi],
+        "answer_delim": DELIMITERS[args.task],
+        "answer_delim_id": VOCAB.index(DELIMITERS[args.task]),
     }
     with open(os.path.join(data_dir, "meta.json"), "w", encoding="utf-8") as fh:
         json.dump(meta, fh, indent=2)

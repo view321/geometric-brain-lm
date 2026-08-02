@@ -176,6 +176,115 @@ def generate(model, tokenizer, prompt: str = "", *, max_new: int = 128,
 
 
 @torch.no_grad()
+def task_accuracy(model, stream, *, batch_size: int, seq_len: int, tbptt: int,
+                  batches: int = 50, rounds=None, split: str = "val",
+                  autocast_dtype=None) -> dict:
+    """Score only the tokens that carry the task, not the whole sequence.
+
+    On a synthetic task the inputs are random by construction and irreducible,
+    so sequence perplexity is mostly measuring noise. Parity is the extreme
+    case: with 16 random bits, one token in ~19 is the answer, and solving the
+    task perfectly moves total perplexity by a few percent. Answer accuracy
+    moves from chance to 100%.
+
+    Answer positions are those following the task delimiter and before the next
+    EOS; EOS targets are excluded, since predicting the end of an example is
+    trivial and would dilute the number the same way the inputs do.
+
+    `rounds` overrides inference depth, so this can be swept the way
+    compute_scaling sweeps perplexity -- which is the measurement that would
+    actually show extra computation buying a correct answer.
+    """
+    meta = stream.meta
+    delim = meta.get("answer_delim_id")
+    if delim is None:
+        return {}
+    eos = int(meta.get("eos_id", 0))
+
+    original = getattr(model, "cfg", None) and model.cfg.rounds
+    if rounds is not None and hasattr(model, "cfg"):
+        model.cfg.rounds = rounds
+    model.eval()
+    device = next(model.parameters()).device
+
+    total_nll, total_correct, total_n = 0.0, 0, 0
+    try:
+        for i, (x, y) in enumerate(stream.sequential_batches(split, batch_size, seq_len)):
+            if batches and i >= batches:
+                break
+            # A target is an answer if the delimiter has been seen since the
+            # last EOS. Sequential, but T is small and this runs once.
+            seen = torch.zeros(x.shape[0], dtype=torch.bool, device=device)
+            mask = torch.zeros_like(x, dtype=torch.bool)
+            for t in range(x.shape[1]):
+                tok = x[:, t]
+                seen = torch.where(tok == eos, torch.zeros_like(seen),
+                                   seen | (tok == delim))
+                mask[:, t] = seen
+            mask &= y != eos
+            if not bool(mask.any()):
+                continue
+
+            state = model.init_state(x.shape[0], device)
+            for start in range(0, x.shape[1], tbptt):
+                xc, yc = x[:, start:start + tbptt], y[:, start:start + tbptt]
+                mc = mask[:, start:start + tbptt]
+                if autocast_dtype is not None:
+                    with torch.autocast(device.type, dtype=autocast_dtype):
+                        logits, state, _ = model(xc, state, collect_stats=False)
+                else:
+                    logits, state, _ = model(xc, state, collect_stats=False)
+                state = _detach(state)
+                if not bool(mc.any()):
+                    continue
+                flat = logits.float().reshape(-1, logits.shape[-1])[mc.reshape(-1)]
+                tgt = yc.reshape(-1)[mc.reshape(-1)]
+                total_nll += float(F.cross_entropy(flat, tgt, reduction="sum"))
+                total_correct += int((flat.argmax(-1) == tgt).sum())
+                total_n += int(tgt.numel())
+    finally:
+        if rounds is not None and original is not None:
+            model.cfg.rounds = original
+
+    if total_n == 0:
+        return {"answer_tokens": 0}
+    return {
+        "answer_tokens": total_n,
+        "answer_acc": total_correct / total_n,
+        "answer_loss": total_nll / total_n,
+        "answer_ppl": math.exp(min(total_nll / total_n, 60.0)),
+    }
+
+
+@torch.no_grad()
+def task_scaling(model, stream, *, batch_size: int, seq_len: int, tbptt: int,
+                 rounds=(1, 2, 3, 4, 6, 8, 12, 16, 24), batches: int = 30,
+                 autocast_dtype=None) -> dict:
+    """Answer accuracy as a function of inference depth.
+
+    This is the measurement the whole latent-depth idea rests on. If accuracy
+    rises with rounds -- particularly past the trained depth, and particularly
+    on instances longer than any seen in training -- then extra computation is
+    buying correct answers rather than just lower average surprise.
+    """
+    if not stream.meta.get("answer_delim_id"):
+        return {}
+    out = {}
+    for r in rounds:
+        m = task_accuracy(model, stream, batch_size=batch_size, seq_len=seq_len,
+                          tbptt=tbptt, batches=batches, rounds=r,
+                          autocast_dtype=autocast_dtype)
+        if m.get("answer_tokens"):
+            out[f"acc_rounds{r}"] = m["answer_acc"]
+    if not out:
+        return {}
+    best = max(out, key=out.get)
+    out["best_acc_rounds"] = int(best.replace("acc_rounds", ""))
+    out["best_acc"] = out[best]
+    return out
+
+
+@torch.no_grad()
 def compute_scaling(model, stream, *, batch_size: int, seq_len: int, tbptt: int,
                     rounds=(1, 2, 3, 4, 6, 8, 12, 16, 24), batches: int = 40,
                     autocast_dtype=None) -> dict:
@@ -543,6 +652,9 @@ def main() -> None:
                          "checkpoint trained with --train-tokens.")
     ap.add_argument("--gap-batches", type=int, default=100,
                     help="batches per side; the same count is used for both")
+    ap.add_argument("--task", action="store_true",
+                    help="score only the answer tokens of a synthetic task, and "
+                         "sweep accuracy against inference depth")
     ap.add_argument("--scaling", action="store_true",
                     help="perplexity as a function of latent iterations at "
                          "inference, plus the state settling trajectory")
@@ -578,6 +690,11 @@ def main() -> None:
         metrics.update(memory_horizon(model, trials=args.memory_trials))
     if args.induction:
         metrics.update(induction_probe(model))
+    if args.task:
+        common = dict(batch_size=bs, seq_len=sl, tbptt=cfg.train.tbptt_chunk)
+        metrics.update(task_accuracy(model, stream, batches=args.batches or 50,
+                                     **common))
+        metrics.update(task_scaling(model, stream, **common))
     if args.scaling:
         metrics.update(compute_scaling(
             model, stream, batch_size=bs, seq_len=sl,
