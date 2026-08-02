@@ -44,6 +44,28 @@ class BrainConfig:
     k_min: int = 4         # outbound edges used by a barely-active neuron
     k_max: int = 32        # outbound edges used by the most active neuron
     rounds: int = 3        # propagation rounds per token
+
+    # Randomized latent depth. When rounds_max > 0, each training forward draws
+    # its round count from [rounds_min, rounds_max] instead of using a fixed
+    # `rounds`. The model then cannot rely on a particular iteration count and
+    # has to learn a state update that keeps improving as it is applied, which
+    # is what makes spending more iterations at inference pay off. `rounds`
+    # remains the evaluation default.
+    #
+    # This is the one change that separates "compute is tied to tokens emitted"
+    # from "compute can be spent without emitting anything".
+    rounds_min: int = 0
+    rounds_max: int = 0    # 0 = fixed depth, the original behaviour
+
+    # Re-inject the token at every propagation round instead of only once.
+    #
+    # Without this the iteration is `z <- f(z)`, whose fixed points do not
+    # depend on the input at all: iterating longer washes the token out and
+    # deeper is monotonically worse. With it the iteration is `z <- f(z, x)`,
+    # the deep-equilibrium form, whose fixed point is the state consistent with
+    # this input -- so extra rounds refine an answer instead of forgetting the
+    # question. This is the difference between iterating and thinking.
+    inject_every_round: bool = False
     decay: float = 0.85    # state leak, per round and across tokens
 
     # Global multiplier on the per-neuron write rate, which is otherwise
@@ -303,6 +325,29 @@ def _frozen() -> RunConfig:
     return cfg
 
 
+def _think() -> RunConfig:
+    """Randomized latent depth: the state update must survive being iterated.
+
+    Same model as ref2, trained at a depth drawn from [1, 8] rather than fixed
+    at 3, and with k_max cut to 8 since mean_k sits at ~4.3 and the other 24
+    candidate edges are computed only to be masked away.
+
+    The claim to test afterwards is `evaluate.py --scaling`: perplexity should
+    keep falling as inference rounds increase, including past the training
+    range. That is compute decoupled from tokens emitted, measured rather than
+    asserted.
+    """
+    cfg = _ref2()
+    cfg.name = "think-d16"
+    cfg.brain.rounds = 4
+    cfg.brain.rounds_min = 1
+    cfg.brain.rounds_max = 8
+    cfg.brain.k_max = 8
+    cfg.brain.k_min = 1
+    cfg.brain.inject_every_round = True
+    return cfg
+
+
 def _frozen2() -> RunConfig:
     """The echo-state control for `ref2`. A control has to share the
     architecture it controls for, so this tracks ref2 rather than ref."""
@@ -354,6 +399,7 @@ PRESETS = {
     "frozen": _frozen,
     "freeweight2": _free_weights2,
     "frozen2": _frozen2,
+    "think": _think,
     "gru": _gru,
     "transformer": _transformer,
 }

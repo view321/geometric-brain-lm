@@ -336,7 +336,8 @@ class BrainLM(nn.Module):
         return sparse, val, idx
 
     def _propagate(self, state: torch.Tensor, w_all: torch.Tensor,
-                   signs: torch.Tensor, decay: torch.Tensor):
+                   signs: torch.Tensor, decay: torch.Tensor,
+                   inject: torch.Tensor | None = None):
         cfg = self.cfg
         b = state.shape[0]
         state, val, idx = self._kwta(state)
@@ -366,12 +367,30 @@ class BrainLM(nn.Module):
         arrived = torch.zeros_like(state).scatter_add(
             1, nbr.reshape(b, -1), signal.reshape(b, -1)
         )
+        if inject is not None:
+            # Keeps the question present at every iteration; see
+            # `inject_every_round` in the config for why this is what makes
+            # extra rounds refine rather than forget.
+            arrived = arrived + inject
         out = self._homeostasis(self._activate(decay.unsqueeze(0) * state + arrived))
         return out, idx, k_i
 
+    def sample_rounds(self) -> int:
+        """Latent depth for this forward pass.
+
+        Randomized during training when `rounds_max` is set, so the update has
+        to be useful at any iteration count rather than tuned to exactly one.
+        """
+        cfg = self.cfg
+        if not self.training or cfg.rounds_max <= 0:
+            return cfg.rounds
+        lo = max(cfg.rounds_min, 1)
+        return int(torch.randint(lo, max(cfg.rounds_max, lo) + 1, (1,)).item())
+
     def step(self, tok: torch.Tensor, state: torch.Tensor, w_all: torch.Tensor,
              signs: torch.Tensor, stats: dict | None = None,
-             decay: torch.Tensor | None = None) -> torch.Tensor:
+             decay: torch.Tensor | None = None,
+             rounds: int | None = None) -> torch.Tensor:
         cfg = self.cfg
         if decay is None:
             decay = self.decays()
@@ -391,6 +410,7 @@ class BrainLM(nn.Module):
         # config. Adding them directly makes the k-WTA discard ~93% of every
         # token's seeds, so the state coasts on whatever entered first instead of
         # integrating the sequence.
+        injection = None
         if cfg.legacy_injection:
             # The pre-fix path, kept bit-for-bit so checkpoints trained before
             # the fix can still be measured as the models they actually are.
@@ -411,9 +431,8 @@ class BrainLM(nn.Module):
             # neuron accepts half and tracks. Steady-state magnitudes still match
             # across bands, since an EMA converges to the mean of its input.
             write = self.gate_logit.exp() * (1.0 - decay)         # [N]
-            state = self._homeostasis(
-                decay.unsqueeze(0) * state + write.unsqueeze(0) * seed
-            )
+            injection = write.unsqueeze(0) * seed
+            state = self._homeostasis(decay.unsqueeze(0) * state + injection)
 
         if stats is not None:
             # Switch-style load balance, measured where routing actually happens.
@@ -427,8 +446,9 @@ class BrainLM(nn.Module):
             stats["f_sum"] = stats.get("f_sum", 0.0) + hits
             stats["n_tok"] = stats.get("n_tok", 0) + 1
 
-        for _ in range(cfg.rounds):
-            state, idx, k_i = self._propagate(state, w_all, signs, decay)
+        recur = injection if cfg.inject_every_round else None
+        for _ in range(cfg.rounds if rounds is None else rounds):
+            state, idx, k_i = self._propagate(state, w_all, signs, decay, recur)
             if stats is not None:
                 stats["k_sum"] = stats.get("k_sum", 0.0) + k_i.mean()
                 stats["k_count"] = stats.get("k_count", 0) + 1
@@ -475,11 +495,12 @@ class BrainLM(nn.Module):
         w_all = self.edge_weights()
         signs = self.signs()
         decay = self.decays()
+        rounds = self.sample_rounds()
         stats: dict | None = {} if collect_stats else None
 
         logits = []
         for i in range(t):
-            state = self.step(x[:, i], state, w_all, signs, stats, decay)
+            state = self.step(x[:, i], state, w_all, signs, stats, decay, rounds)
             logits.append(self.readout(state))
         return torch.stack(logits, dim=1), state, (stats or {})
 

@@ -176,6 +176,68 @@ def generate(model, tokenizer, prompt: str = "", *, max_new: int = 128,
 
 
 @torch.no_grad()
+def compute_scaling(model, stream, *, batch_size: int, seq_len: int, tbptt: int,
+                    rounds=(1, 2, 3, 4, 6, 8, 12, 16, 24), batches: int = 40,
+                    autocast_dtype=None) -> dict:
+    """Does spending more latent iterations at inference improve the answer?
+
+    This is the falsifiable core of "reasoning by changing state". Propagation
+    rounds carry no parameters, so the same checkpoint can be run at any depth.
+    If perplexity keeps falling as rounds increase -- especially past the depth
+    it was trained at -- then the state update is a genuine refinement operator
+    and compute is decoupled from tokens emitted. If it degrades immediately,
+    the model learned one fixed transformation and there is no thinking to do.
+
+    Also reports how far the state moves per round. A settling trajectory (the
+    step size shrinking toward zero) is attractor dynamics; a flat one means the
+    state is churning rather than converging on anything.
+    """
+    if not hasattr(model, "cfg") or not hasattr(model, "axon"):
+        return {}
+    original = model.cfg.rounds
+    out: dict = {}
+    try:
+        for r in rounds:
+            model.cfg.rounds = r
+            m = evaluate(model, stream, batch_size=batch_size, seq_len=seq_len,
+                         tbptt=tbptt, max_batches=batches,
+                         autocast_dtype=autocast_dtype)
+            out[f"ppl_rounds{r}"] = m["ppl"]
+    finally:
+        model.cfg.rounds = original
+
+    scores = {r: out[f"ppl_rounds{r}"] for r in rounds}
+    best = min(scores, key=scores.get)
+    out["best_rounds"] = best
+    out["best_ppl"] = scores[best]
+    out["trained_rounds"] = original
+    # Did extra compute beyond the training depth still help? That is the claim.
+    deeper = [r for r in rounds if r > original]
+    if deeper:
+        out["gain_beyond_trained"] = (
+            scores[original] - min(scores[r] for r in deeper)
+            if original in scores else float("nan")
+        )
+
+    # Settling trajectory: relative movement of the state per round.
+    device = next(model.parameters()).device
+    x, _ = stream.get_batch("val", min(batch_size, 8), seq_len)
+    w, signs, dec = model.edge_weights(), model.signs(), model.decays()
+    state = model.init_state(x.shape[0], device)
+    for t in range(min(16, seq_len)):          # warm the state on real context
+        state = model.step(x[:, t], state, w, signs, None, dec, model.cfg.rounds)
+    deltas = []
+    prev = state
+    for _ in range(max(rounds)):
+        nxt, _, _ = model._propagate(prev, w, signs, dec)
+        deltas.append(float((nxt - prev).norm() / prev.norm().clamp_min(1e-9)))
+        prev = nxt
+    out["settle_deltas"] = [round(d, 4) for d in deltas]
+    out["settles"] = deltas[-1] < 0.5 * deltas[0]
+    return out
+
+
+@torch.no_grad()
 def generalization_gap(model, stream, *, train_tokens: int, batch_size: int,
                        seq_len: int, tbptt: int, batches: int = 100,
                        tokenizer=None, autocast_dtype=None) -> dict:
@@ -476,6 +538,9 @@ def main() -> None:
                          "checkpoint trained with --train-tokens.")
     ap.add_argument("--gap-batches", type=int, default=100,
                     help="batches per side; the same count is used for both")
+    ap.add_argument("--scaling", action="store_true",
+                    help="perplexity as a function of latent iterations at "
+                         "inference, plus the state settling trajectory")
     ap.add_argument("--gap-tokens", type=int, default=0,
                     help="split point to use instead of the checkpoint's cap. "
                          "Run this on a full-corpus checkpoint as a control: it "
@@ -508,6 +573,10 @@ def main() -> None:
         metrics.update(memory_horizon(model, trials=args.memory_trials))
     if args.induction:
         metrics.update(induction_probe(model))
+    if args.scaling:
+        metrics.update(compute_scaling(
+            model, stream, batch_size=bs, seq_len=sl,
+            tbptt=cfg.train.tbptt_chunk, batches=max(args.batches, 20)))
     if args.gap:
         # The cap is recorded in the checkpoint, so the two slices are the ones
         # this model actually saw and did not see.
