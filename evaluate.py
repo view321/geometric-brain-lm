@@ -301,7 +301,8 @@ def induction_probe(model, *, gaps=(2, 4, 8, 16, 32, 64), trials: int = 64,
     A score near zero means no in-context learning at all -- the model predicts
     only from what it memorised, never from what it just read. That is
     compatible with excellent perplexity, which is exactly why it needs its own
-    measurement. Reported in nats; anything under ~0.1 is noise.
+    measurement. Reported in nats, each with its standard error over trials:
+    compare a score against its own `_se`, not against a fixed threshold.
 
     Works for the baselines too, so the geometric model can be compared against
     a GRU and a transformer on the one axis transformers are known to win.
@@ -330,7 +331,11 @@ def induction_probe(model, *, gaps=(2, 4, 8, 16, 32, 64), trials: int = 64,
             logits, _, _ = model(seq.to(device), None, collect_stats=False)
             logp = torch.log_softmax(logits[:, -1].float(), dim=-1)
             scores.append(logp.gather(1, b[:, None].to(device)).squeeze(1))
-        out[f"induction_gap{gap}"] = float((scores[0] - scores[1]).mean())
+        diff = scores[0] - scores[1]
+        out[f"induction_gap{gap}"] = float(diff.mean())
+        # Standard error over trials, so "is this above noise?" is answerable
+        # instead of being compared against a threshold someone guessed.
+        out[f"induction_gap{gap}_se"] = float(diff.std() / max(len(diff) ** 0.5, 1))
 
     vals = [out[f"induction_gap{g}"] for g in gaps]
     out["induction_best"] = max(vals)

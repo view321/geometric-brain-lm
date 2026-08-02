@@ -66,6 +66,19 @@ class BrainConfig:
     # this input -- so extra rounds refine an answer instead of forgetting the
     # question. This is the difference between iterating and thinking.
     inject_every_round: bool = False
+
+    # Geometric falloff applied to the re-injection across rounds: round r gets
+    # `inject_decay ** r` of it. 1.0 injects equally forever.
+    #
+    # Injecting at full strength every round makes the fixed point a pure
+    # function of the current token -- the accumulated injection eventually
+    # swamps everything the state was carrying, so deep iteration converges on
+    # something that has forgotten the context. That is the measured failure:
+    # the state settles cleanly, but the attractor scores worse than the
+    # transient, and perplexity is minimised a few rounds in and rises
+    # thereafter. Decaying the injection keeps the question present while the
+    # answer forms, then lets later rounds refine without being overwritten.
+    inject_decay: float = 1.0
     decay: float = 0.85    # state leak, per round and across tokens
 
     # Global multiplier on the per-neuron write rate, which is otherwise

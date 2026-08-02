@@ -447,8 +447,11 @@ class BrainLM(nn.Module):
             stats["n_tok"] = stats.get("n_tok", 0) + 1
 
         recur = injection if cfg.inject_every_round else None
-        for _ in range(cfg.rounds if rounds is None else rounds):
-            state, idx, k_i = self._propagate(state, w_all, signs, decay, recur)
+        for r in range(cfg.rounds if rounds is None else rounds):
+            step_inject = recur
+            if recur is not None and cfg.inject_decay != 1.0:
+                step_inject = recur * (cfg.inject_decay ** r)
+            state, idx, k_i = self._propagate(state, w_all, signs, decay, step_inject)
             if stats is not None:
                 stats["k_sum"] = stats.get("k_sum", 0.0) + k_i.mean()
                 stats["k_count"] = stats.get("k_count", 0) + 1
