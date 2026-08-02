@@ -105,8 +105,16 @@ What counts as "deserves further study":
   way to write down a weight matrix.
 - **Beating `ablate-freeweight`.** Then the distance kernel is doing work that
   free parameters cannot, which is the strongest possible result here.
-- **`usage_uniformity` high with `ratio` well below 1.** Neurons broadly used,
-  edges much shorter than the ambient scale: the point cloud has organised.
+- **`usage_uniformity` staying high.** Neurons broadly used rather than a
+  minority carrying everything.
+
+  Note that `ratio` (mean edge length over ambient distance) does **not** work
+  as an organisation signal, despite the intuition that a learned point cloud
+  should pull its edges in. Measured at initialisation it is 0.513 at d=16 and
+  0.114 at d=4, so it is dominated by dimension; and training moved it *upward*
+  in both cases (to 0.638 and 0.157 respectively). Read it as a diagnostic of
+  `d_space`, and compare a trained value only against an untrained model at the
+  same `d`, never across dimensions or against a fixed threshold.
 - **`k_surprisal_corr` positive.** Fan-out tracks token difficulty — the
   adaptive-compute story.
 
