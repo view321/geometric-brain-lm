@@ -173,6 +173,57 @@ def generate(model, tokenizer, prompt: str = "", *, max_new: int = 128,
 
 
 @torch.no_grad()
+def induction_probe(model, *, gaps=(2, 4, 8, 16, 32, 64), trials: int = 64,
+                    prefix: int = 8, seed: int = 0) -> dict:
+    """Can the model complete `A B ... A -> B` from its own context?
+
+    The canonical in-context learning test, and the sharpest one available at
+    this scale. Two sequences are scored: one where the pair `A B` appeared
+    earlier, and a control where it did not. The gap in log-probability of `B`
+    at the final position is how much the model learned from the context rather
+    than from training statistics.
+
+    A score near zero means no in-context learning at all -- the model predicts
+    only from what it memorised, never from what it just read. That is
+    compatible with excellent perplexity, which is exactly why it needs its own
+    measurement. Reported in nats; anything under ~0.1 is noise.
+
+    Works for the baselines too, so the geometric model can be compared against
+    a GRU and a transformer on the one axis transformers are known to win.
+    """
+    device = next(model.parameters()).device
+    vocab = model.cfg.vocab_size
+    gen = torch.Generator(device="cpu").manual_seed(seed)
+
+    def rnd(*shape):
+        return torch.randint(0, vocab, shape, generator=gen)
+
+    out = {}
+    for gap in gaps:
+        # A B <gap fillers> A   -- and a control with an unrelated pair in place
+        # of A B, so the only difference is whether the context contains the
+        # answer.
+        a, b = rnd(trials), rnd(trials)
+        x, y = rnd(trials), rnd(trials)
+        head, filler = rnd(trials, prefix), rnd(trials, gap)
+
+        treat = torch.cat([head, a[:, None], b[:, None], filler, a[:, None]], dim=1)
+        ctrl = torch.cat([head, x[:, None], y[:, None], filler, a[:, None]], dim=1)
+
+        scores = []
+        for seq in (treat, ctrl):
+            logits, _, _ = model(seq.to(device), None, collect_stats=False)
+            logp = torch.log_softmax(logits[:, -1].float(), dim=-1)
+            scores.append(logp.gather(1, b[:, None].to(device)).squeeze(1))
+        out[f"induction_gap{gap}"] = float((scores[0] - scores[1]).mean())
+
+    vals = [out[f"induction_gap{g}"] for g in gaps]
+    out["induction_best"] = max(vals)
+    out["induction_best_gap"] = gaps[int(torch.tensor(vals).argmax())]
+    return out
+
+
+@torch.no_grad()
 def memory_horizon(model, *, tokens: int = 128, trials: int = 16,
                    seed: int = 0, stream=None) -> dict:
     """How long does one token's footprint survive in the state?
@@ -363,6 +414,9 @@ def main() -> None:
     ap.add_argument("--memory", action="store_true",
                     help="measure the effective context window of the recurrence")
     ap.add_argument("--memory-trials", type=int, default=16)
+    ap.add_argument("--induction", action="store_true",
+                    help="in-context learning: can the model complete "
+                         "A B ... A -> B from its own context?")
     ap.add_argument("--json", default=None, help="write metrics here")
     args = ap.parse_args()
 
@@ -387,6 +441,8 @@ def main() -> None:
         metrics.update(geometry_diagnostics(model, stream))
     if args.memory:
         metrics.update(memory_horizon(model, trials=args.memory_trials))
+    if args.induction:
+        metrics.update(induction_probe(model))
 
     print(json.dumps(metrics, indent=2, sort_keys=True))
     if args.json:

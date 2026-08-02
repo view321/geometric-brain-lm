@@ -206,7 +206,12 @@ def train(cfg, args) -> dict:
                 if stats.get("k_count"):
                     record["mean_k"] = float(stats["k_sum"]) / stats["k_count"]
             logger.write(record)
-            eta = (tc.steps - step) / max(window_n / max(elapsed, 1e-9), 1e-9)
+            # Rate over the whole run, not the logging window's step count over
+            # the total elapsed time -- that mixes a ~20-step numerator with a
+            # whole-run denominator and overstates the ETA by roughly the step
+            # count so far.
+            done = step - start_step + 1
+            eta = (tc.steps - step - 1) / max(done / max(elapsed, 1e-9), 1e-9)
             print(f"step {step:>6}/{tc.steps}  loss {mean:.4f}  ppl {record['ppl']:>8.2f}"
                   f"  {tps:>7.0f} tok/s"
                   + (f"  K {record.get('mean_k', 0):.1f}"
