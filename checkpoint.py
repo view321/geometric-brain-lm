@@ -44,7 +44,7 @@ def save_checkpoint(path: str, model, optimizer, cfg: RunConfig, step: int,
 #: Parameters added after the input-injection fix. A checkpoint missing them was
 #: trained by the pre-fix code and has to be reconstructed with the pre-fix
 #: dynamics, or its metrics describe a different model wearing its weights.
-_POST_FIX_PARAMS = ("gate_logit", "decay_logit")
+_POST_FIX_PARAMS = ("gate_logit", "decay_logit", "log_tau_lo", "log_tau_span")
 
 
 def load_model(path: str, device: str = "cpu", strict: bool = True):

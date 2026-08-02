@@ -230,7 +230,7 @@ def test_legacy_checkpoint() -> None:
         # Rewrite it as a pre-fix checkpoint: drop the two parameters that did
         # not exist then, and the config fields that came with them.
         blob = torch.load(path, map_location="cpu", weights_only=False)
-        for key in ("gate_logit", "decay_logit"):
+        for key in ("gate_logit", "decay_logit", "log_tau_lo", "log_tau_span"):
             blob["model"].pop(key, None)
         for key in ("input_gate", "learn_input_gate", "legacy_injection",
                     "learn_decay", "decay_tau_min", "decay_tau_max", "n_bands"):

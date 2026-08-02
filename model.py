@@ -125,12 +125,25 @@ class BrainLM(nn.Module):
         # Time constants laid out log-uniformly and, crucially, in band order:
         # band b owns the contiguous slice [b*size, (b+1)*size), slowest first.
         # The banded k-WTA relies on that contiguity to slice without gathering.
-        tau = torch.logspace(
-            math.log10(cfg.decay_tau_max), math.log10(cfg.decay_tau_min), n
-        )
-        decay0 = torch.exp(-1.0 / tau).clamp(1e-4, 1 - 1e-4)
+        #
+        # Each neuron's tau is confined to its own band's range rather than being
+        # freely learnable. The band partition is by index, so an unconstrained
+        # tau could drift out of the band whose activation budget it was
+        # allocated, and the banding would then guarantee no timescale diversity
+        # at all -- which is the only thing it exists to do. Confining them also
+        # blocks the collapse this architecture is otherwise drawn to, where the
+        # optimizer shortens every horizon because next-token loss rewards
+        # immediate input sensitivity over memory.
+        band = n // cfg.n_bands
+        edges = torch.linspace(math.log(cfg.decay_tau_max),
+                               math.log(cfg.decay_tau_min), cfg.n_bands + 1)
+        self.register_buffer("log_tau_lo", edges[1:].repeat_interleave(band))
+        self.register_buffer("log_tau_span",
+                             (edges[:-1] - edges[1:]).repeat_interleave(band))
+        # Spread within each band, so a band is a continuum rather than one tau.
+        frac = torch.linspace(0.98, 0.02, band).repeat(cfg.n_bands)
         self.decay_logit = nn.Parameter(
-            torch.log(decay0 / (1 - decay0)), requires_grad=cfg.learn_decay
+            torch.log(frac / (1 - frac)), requires_grad=cfg.learn_decay
         )
 
         if cfg.free_weights:
@@ -296,7 +309,9 @@ class BrainLM(nn.Module):
         """[N] per-neuron retention. Constant unless `learn_decay` is set."""
         if not self.cfg.learn_decay:
             return torch.full_like(self.decay_logit, self.cfg.decay)
-        return torch.sigmoid(self.decay_logit)
+        tau = (self.log_tau_lo
+               + torch.sigmoid(self.decay_logit) * self.log_tau_span).exp()
+        return torch.exp(-1.0 / tau).clamp(1e-4, 1.0 - 1e-4)
 
     def _kwta(self, state: torch.Tensor):
         """Hard k-winners-take-all. Returns (sparse state, values, indices).
