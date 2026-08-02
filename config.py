@@ -174,6 +174,13 @@ class TrainConfig:
     reseed_noise: float = 0.1
     reseed_warmup: int = 1000    # no reseeding before this step
 
+    # Cap on distinct training tokens; 0 = the whole corpus. Comparing two
+    # parameterizations at convergence on abundant in-distribution data is the
+    # worst available test of an inductive bias: a constrained model can only
+    # show its advantage where the unconstrained one can overfit or has too
+    # little signal. Set this to force many epochs over a small subset.
+    train_tokens: int = 0
+
     eval_interval: int = 1000
     eval_batches: int = 50
     sample_interval: int = 2000

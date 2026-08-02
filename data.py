@@ -28,6 +28,14 @@ class TokenStream:
         vocab_size, eos_id, meta, val_utf8_bytes, train_utf8_bytes, device
     """
 
+    #: Cap on the training tokens `get_batch` will sample from; 0 = the whole
+    #: split. Set this to force repeated epochs over a small subset. At the full
+    #: corpus a short run never revisits a token, so there is no overfitting
+    #: pressure at all and an inductive bias has nothing to show -- which makes
+    #: the unconstrained model look equal when it is merely unconstrained on
+    #: data it will never see twice.
+    train_limit: int = 0
+
     def __init__(self, data_dir: str, device: str = "cpu", seed: int = 1234) -> None:
         self.data_dir = os.path.abspath(data_dir)
         meta_path = os.path.join(self.data_dir, META_FILE)
@@ -92,7 +100,14 @@ class TokenStream:
         if batch_size < 1:
             raise ValueError(f"batch_size must be >= 1, got {batch_size}")
         # valid starts: i + seq_len + 1 <= n  =>  i in [0, n - seq_len - 1]
-        starts = self._rng.integers(0, arr.size - seq_len, size=batch_size)
+        usable = arr.size
+        cap = self.train_limit if split == "train" else 0
+        if cap:
+            usable = min(usable, cap)
+            if usable <= seq_len:
+                raise ValueError(
+                    f"train_limit={cap} is too small for seq_len={seq_len}")
+        starts = self._rng.integers(0, usable - seq_len, size=batch_size)
         x = np.empty((batch_size, seq_len), dtype=np.int64)
         y = np.empty((batch_size, seq_len), dtype=np.int64)
         for row, i in enumerate(starts):

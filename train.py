@@ -81,6 +81,7 @@ def train(cfg, args) -> dict:
     os.makedirs(run_dir, exist_ok=True)
 
     stream = TokenStream(cfg.data_dir, device=str(device), seed=cfg.train.seed)
+    stream.train_limit = cfg.train.train_tokens
     tokenizer = load_tokenizer(cfg.data_dir)
     cfg.brain.vocab_size = stream.vocab_size
     cfg.baseline.vocab_size = stream.vocab_size
@@ -115,8 +116,15 @@ def train(cfg, args) -> dict:
 
     print(f"[model] {cfg.model} '{cfg.name}'  params={counts['total']:,} "
           f"(readout {counts['readout']:,}, geometry {counts['geometry']:,})")
+    seen = tc.steps * tc.batch_size * tc.seq_len
+    pool = min(stream.n_tokens("train"), tc.train_tokens or stream.n_tokens("train"))
     print(f"[data]  vocab={stream.vocab_size} train={stream.n_tokens('train'):,} tok"
           f"  val={stream.n_tokens('val'):,} tok")
+    print(f"[data]  sampling from {pool:,} tokens; the run will draw {seen:,} "
+          f"({seen / pool:.1f} epochs)"
+          + ("  <- single pass: no overfitting pressure, so a constrained "
+             "parameterization cannot show an advantage here"
+             if seen < pool else ""))
     print(f"[opt]   dtype={autocast_dtype or 'float32'} bs={tc.batch_size} "
           f"seq={tc.seq_len} tbptt={tc.tbptt_chunk} steps={tc.steps}")
     if is_brain:
