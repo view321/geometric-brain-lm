@@ -354,6 +354,12 @@ def main() -> None:
     ap.add_argument("--prompt", default="")
     ap.add_argument("--temperature", type=float, default=0.8)
     ap.add_argument("--diagnostics", action="store_true")
+    ap.add_argument("--rounds", type=int, default=None,
+                    help="override propagation rounds at evaluation time. "
+                         "--rounds 0 disables spreading entirely, so the gap "
+                         "against the unmodified score is what the connectome "
+                         "is actually contributing. Rounds carry no parameters, "
+                         "so the checkpoint still loads unchanged.")
     ap.add_argument("--memory", action="store_true",
                     help="measure the effective context window of the recurrence")
     ap.add_argument("--memory-trials", type=int, default=16)
@@ -361,6 +367,11 @@ def main() -> None:
     args = ap.parse_args()
 
     model, cfg = load_model(args.ckpt, device=args.device)
+    if args.rounds is not None:
+        if not hasattr(model, "cfg"):
+            raise SystemExit("--rounds only applies to the brain model")
+        print(f"[ablate] propagation rounds {model.cfg.rounds} -> {args.rounds}")
+        model.cfg.rounds = args.rounds
     data_dir = args.data_dir or cfg.data_dir
     stream = TokenStream(data_dir, device=args.device)
     tok = load_tokenizer(data_dir)
