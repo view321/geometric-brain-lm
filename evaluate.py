@@ -193,8 +193,10 @@ def generalization_gap(model, stream, *, train_tokens: int, batch_size: int,
     """
     if train_tokens <= 0:
         raise ValueError(
-            "generalization_gap needs the training cap; the checkpoint was "
-            "trained on the whole corpus, so there is no unseen slice to score")
+            "generalization_gap needs a split point. This checkpoint was "
+            "trained on the whole corpus, so nothing was withheld from it. "
+            "Pass --gap-tokens N to split anyway -- useful as a control, since "
+            "a single-pass model should show a gap near zero.")
     total = stream.n_tokens("train")
     if train_tokens >= total:
         raise ValueError(
@@ -474,6 +476,12 @@ def main() -> None:
                          "checkpoint trained with --train-tokens.")
     ap.add_argument("--gap-batches", type=int, default=100,
                     help="batches per side; the same count is used for both")
+    ap.add_argument("--gap-tokens", type=int, default=0,
+                    help="split point to use instead of the checkpoint's cap. "
+                         "Run this on a full-corpus checkpoint as a control: it "
+                         "never repeated a token, so its gap should be ~0, which "
+                         "shows the gap measures memorisation and not some "
+                         "difference between the two slices themselves.")
     ap.add_argument("--json", default=None, help="write metrics here")
     args = ap.parse_args()
 
@@ -504,7 +512,7 @@ def main() -> None:
         # The cap is recorded in the checkpoint, so the two slices are the ones
         # this model actually saw and did not see.
         metrics.update(generalization_gap(
-            model, stream, train_tokens=cfg.train.train_tokens,
+            model, stream, train_tokens=args.gap_tokens or cfg.train.train_tokens,
             batch_size=bs, seq_len=sl, tbptt=cfg.train.tbptt_chunk,
             batches=args.gap_batches, tokenizer=tok,
         ))
